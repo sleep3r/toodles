@@ -83,7 +83,7 @@ pub async fn handle_voice(
     bot.edit_message_text(
         msg.chat.id,
         status.id,
-        format!("🎙 *Transcript:* {transcript}"),
+        format!("🎙 Transcript: {transcript}"),
     )
     .await
     .ok();

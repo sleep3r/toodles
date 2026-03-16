@@ -26,8 +26,7 @@ pub async fn handle_text(
     };
 
     if !config.is_user_allowed(user_id) {
-        bot.send_message(msg.chat.id, "⛔ You are not authorised to use this bot.")
-            .await?;
+        send_reply(&bot, &msg, "⛔ You are not authorised to use this bot.").await?;
         return Ok(());
     }
 
