@@ -1,12 +1,16 @@
 mod config;
 mod handlers;
 mod session;
+mod setup;
+mod transcription;
 
 use std::sync::Arc;
 
+use clap::Parser;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use config::Config;
 use handlers::{
@@ -15,6 +19,7 @@ use handlers::{
     voice::handle_voice,
 };
 use session::SessionManager;
+use transcription::LocalTranscriber;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Bot commands
@@ -91,8 +96,27 @@ async fn command_handler(
 // Entry point
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Command-line arguments.
+#[derive(Parser)]
+#[command(name = "toodles", about = "Telegram bot wrapper for gemini-cli")]
+struct Cli {
+    /// Run interactive setup wizard to generate .env configuration.
+    #[arg(long)]
+    setup: bool,
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
+    if cli.setup {
+        if let Err(e) = setup::run_setup() {
+            eprintln!("Setup failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Load .env file if present (ignores missing file).
     dotenvy::dotenv().ok();
 
@@ -110,8 +134,49 @@ async fn main() {
     info!(
         gemini_cli = %config.gemini_cli_path,
         allowed_users = config.allowed_user_ids.len(),
+        local_transcription = config.use_local_transcription,
         "Starting Toodles bot"
     );
+
+    // Load local transcription engine if configured.
+    let local_transcriber: Option<Arc<Mutex<LocalTranscriber>>> =
+        if config.use_local_transcription {
+            // Download model if not present yet.
+            if !transcription::is_model_downloaded(&config.models_dir) {
+                info!("Parakeet model not found — downloading…");
+                if let Err(e) = transcription::download_model(&config.models_dir).await {
+                    error!("Failed to download Parakeet model: {e:#}");
+                    warn!("Local transcription disabled — falling back to Whisper API");
+                    None
+                } else {
+                    match LocalTranscriber::load(&config.models_dir) {
+                        Ok(t) => {
+                            info!("Parakeet model loaded");
+                            Some(Arc::new(Mutex::new(t)))
+                        }
+                        Err(e) => {
+                            error!("Failed to load Parakeet model: {e:#}");
+                            warn!("Local transcription disabled — falling back to Whisper API");
+                            None
+                        }
+                    }
+                }
+            } else {
+                match LocalTranscriber::load(&config.models_dir) {
+                    Ok(t) => {
+                        info!("Parakeet model loaded");
+                        Some(Arc::new(Mutex::new(t)))
+                    }
+                    Err(e) => {
+                        error!("Failed to load Parakeet model: {e:#}");
+                        warn!("Local transcription disabled — falling back to Whisper API");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
     let bot = Bot::new(&config.telegram_bot_token);
     let sessions = Arc::new(SessionManager::new(config.clone()));
@@ -129,7 +194,7 @@ async fn main() {
         .branch(Message::filter_text().endpoint(handle_text));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config, sessions])
+        .dependencies(dptree::deps![config, sessions, local_transcriber])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

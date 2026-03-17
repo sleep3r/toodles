@@ -5,22 +5,25 @@ use serde::Deserialize;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::Message;
-use tracing::error;
+use tokio::sync::Mutex;
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::session::SessionManager;
+use crate::transcription::LocalTranscriber;
 
 use super::message::send_reply;
 use super::session_key;
 
-/// Handle a voice message: download the OGG file, transcribe it via
-/// OpenAI Whisper (if `OPENAI_API_KEY` is configured), and forward
-/// the transcription to the gemini-cli session.
+/// Handle a voice message: download the OGG file, transcribe it either
+/// locally (Parakeet) or via OpenAI Whisper, and forward the transcription
+/// to the gemini-cli session.
 pub async fn handle_voice(
     bot: Bot,
     msg: Message,
     config: Arc<Config>,
     sessions: Arc<SessionManager>,
+    local_transcriber: Option<Arc<Mutex<LocalTranscriber>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0,
@@ -37,19 +40,6 @@ pub async fn handle_voice(
         None => return Ok(()),
     };
 
-    let api_key = match &config.openai_api_key {
-        Some(k) => k.clone(),
-        None => {
-            send_reply(
-                &bot,
-                &msg,
-                "🎙 Voice messages require `OPENAI_API_KEY` to be set for Whisper transcription.",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
     // Notify the user that we are processing the audio.
     let status = send_reply(&bot, &msg, "🎙 Transcribing voice message…").await?;
 
@@ -58,14 +48,57 @@ pub async fn handle_voice(
     let mut audio_bytes = Vec::new();
     bot.download_file(&file.path, &mut audio_bytes).await?;
 
-    // Transcribe via OpenAI Whisper API.
-    let transcript = match transcribe_with_whisper(&api_key, audio_bytes).await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Whisper transcription failed: {e}");
-            bot.edit_message_text(msg.chat.id, status.id, format!("❌ Transcription failed: {e}"))
+    // Transcribe: try local first, then fallback to OpenAI Whisper.
+    let transcript = if let Some(ref transcriber) = local_transcriber {
+        match transcribe_locally(transcriber, &audio_bytes).await {
+            Ok(t) => {
+                info!("Local transcription succeeded ({} chars)", t.len());
+                t
+            }
+            Err(e) => {
+                error!("Local transcription failed, falling back to Whisper: {e}");
+                // Try Whisper as fallback
+                match &config.openai_api_key {
+                    Some(key) => transcribe_with_whisper(key, audio_bytes).await?,
+                    None => {
+                        bot.edit_message_text(
+                            msg.chat.id,
+                            status.id,
+                            format!("❌ Local transcription failed: {e}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    } else {
+        // No local transcriber — use Whisper API
+        let api_key = match &config.openai_api_key {
+            Some(k) => k.clone(),
+            None => {
+                send_reply(
+                    &bot,
+                    &msg,
+                    "🎙 Voice messages require either local transcription or `OPENAI_API_KEY`.",
+                )
                 .await?;
-            return Ok(());
+                return Ok(());
+            }
+        };
+
+        match transcribe_with_whisper(&api_key, audio_bytes).await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Whisper transcription failed: {e}");
+                bot.edit_message_text(
+                    msg.chat.id,
+                    status.id,
+                    format!("❌ Transcription failed: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
         }
     };
 
@@ -149,8 +182,33 @@ pub async fn handle_voice(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Whisper helpers
+// Transcription backends
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Transcribe using the local Parakeet engine.
+async fn transcribe_locally(
+    transcriber: &Arc<Mutex<LocalTranscriber>>,
+    ogg_bytes: &[u8],
+) -> Result<String> {
+    // Decode OGG → f32 16kHz (CPU-bound, run in blocking thread)
+    let bytes = ogg_bytes.to_vec();
+    let samples = tokio::task::spawn_blocking(move || {
+        crate::transcription::decode_ogg_to_f32_16khz(&bytes)
+    })
+    .await
+    .context("Decode task panicked")??;
+
+    // Run inference (CPU-bound)
+    let transcriber = transcriber.clone();
+    let text = tokio::task::spawn_blocking(move || {
+        let mut engine = transcriber.blocking_lock();
+        engine.transcribe(samples)
+    })
+    .await
+    .context("Transcription task panicked")??;
+
+    Ok(text)
+}
 
 #[derive(Deserialize)]
 struct WhisperResponse {

@@ -1,97 +1,164 @@
-# toodles
+<p align="center">
+  <img src="https://em-content.zobj.net/source/apple/391/poodle_1f429.png" width="96" />
+</p>
 
-A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with streaming responses, voice-message transcription, and per-topic session isolation.
+<h1 align="center">toodles</h1>
 
----
+<p align="center">
+  <strong>Telegram × Gemini CLI — with streaming, voice & local transcription</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-features">Features</a> ·
+  <a href="#%EF%B8%8F-configuration">Config</a> ·
+  <a href="#-architecture">Architecture</a>
+</p>
 
-| Feature | Details |
-|---|---|
-| 💬 **Text messages** | Forwarded to your gemini-cli session; streamed back line-by-line |
-| 🎙 **Voice messages** | Transcribed via OpenAI Whisper, then forwarded to Gemini |
-| 📌 **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
-| 🔄 **Session reset** | `/new` kills the current session and starts a fresh one |
-| 📊 **Status** | `/status` shows the number of active sessions |
-| 🔒 **User allowlist** | Optional `ALLOWED_USER_IDS` restricts access to specific users |
-
----
-
-## Prerequisites
-
-1. **Rust** ≥ 1.70 (install via [rustup](https://rustup.rs))
-2. **gemini-cli** — install the Google Gemini CLI:
-   ```sh
-   npm install -g @google/gemini-cli
-   gemini  # log in and authenticate on first run
-   ```
-3. A **Telegram bot token** — create one via [@BotFather](https://t.me/BotFather)
-4. *(Optional)* An **OpenAI API key** for Whisper voice transcription
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" />
+  <img src="https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram" />
+  <img src="https://img.shields.io/badge/Gemini-886FBF?style=for-the-badge&logo=google-gemini&logoColor=white" alt="Gemini" />
+  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License" />
+</p>
 
 ---
 
-## Quick start
+A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with streaming responses, voice-message transcription (local or cloud), and per-topic session isolation.
+
+## ✨ Features
+
+| | Feature | Details |
+|---|---|---|
+| 💬 | **Streaming text** | Messages forwarded to gemini-cli; responses streamed back line-by-line |
+| 🎙 | **Voice messages** | Transcribed locally via **Parakeet V3** or cloud via **OpenAI Whisper** |
+| 🧠 | **Local transcription** | Offline, no API keys — NVIDIA Parakeet ONNX (int8, ~478 MB) |
+| 📌 | **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
+| 🔄 | **Session management** | `/new` resets, `/status` shows active count |
+| 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
+| 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- **Rust** ≥ 1.70 — [rustup.rs](https://rustup.rs)
+- **gemini-cli** — `npm install -g @google/gemini-cli && gemini`
+- **Telegram bot token** — [@BotFather](https://t.me/BotFather)
+- **ffmpeg** — `brew install ffmpeg` *(required for voice messages)*
+- *(Optional)* **OpenAI API key** — for cloud Whisper fallback
+
+### Install & Run
 
 ```sh
-# 1. Clone and enter the repo
 git clone https://github.com/sleep3r/toodles
 cd toodles
 
-# 2. Create .env from the example
-cp .env.example .env
-$EDITOR .env          # fill in TELEGRAM_BOT_TOKEN at minimum
+# Option A: Interactive setup wizard (recommended)
+make setup
 
-# 3. Build and run
-cargo run --release
+# Option B: Manual config
+cp .env.example .env
+$EDITOR .env
+
+# Run
+make run            # debug
+make release        # optimized build
+make run-release    # run optimized
 ```
 
----
+## 🎙 Voice Transcription
 
-## Configuration
+toodles supports two transcription backends:
 
-All configuration is done through environment variables (or a `.env` file):
+```
+┌────────────────────┐     ┌──────────────┐     ┌───────────┐
+│   Telegram Voice   │────▶│    ffmpeg     │────▶│ Parakeet  │──── text
+│    (OGG Opus)      │     │  (16kHz f32)  │     │   V3 🦜   │
+└────────────────────┘     └──────────────┘     └─────┬─────┘
+                                                      │ fallback
+                                                ┌─────▼─────┐
+                                                │  OpenAI    │
+                                                │ Whisper 🌐 │
+                                                └───────────┘
+```
 
-| Variable | Required | Default | Description |
+| Mode | Latency | Cost | Setup |
 |---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from @BotFather |
-| `ALLOWED_USER_IDS` | ❌ | *(all)* | Comma-separated Telegram user IDs |
-| `GEMINI_CLI_PATH` | ❌ | `gemini` | Path to the gemini-cli binary |
-| `GEMINI_WORKING_DIR` | ❌ | *(cwd)* | Working directory for gemini-cli |
-| `OPENAI_API_KEY` | ❌ | — | OpenAI key for Whisper transcription |
-| `RUST_LOG` | ❌ | `info` | Log level (`trace`, `debug`, `info`, …) |
+| **Local** (Parakeet V3) | ~2-5s | Free | `--setup` downloads 478 MB model |
+| **Cloud** (Whisper API) | ~1-3s | ~$0.006/min | Requires `OPENAI_API_KEY` |
 
----
+The setup wizard will guide you through downloading the model. If both are enabled, local transcription is tried first with automatic cloud fallback.
 
-## Bot commands
+## ⚙️ Configuration
+
+All configuration is managed through environment variables or `.env`:
+
+```sh
+# Required
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+
+# Access control (leave empty for unrestricted)
+ALLOWED_USER_IDS=123456789,987654321
+
+# Gemini CLI
+GEMINI_CLI_PATH=gemini                # path to binary
+GEMINI_WORKING_DIR=/path/to/project   # optional cwd
+
+# Voice — cloud (optional fallback)
+OPENAI_API_KEY=sk-...
+
+# Voice — local (recommended)
+USE_LOCAL_TRANSCRIPTION=true
+MODELS_DIR=~/.toodles/models
+
+# Logging
+RUST_LOG=info
+```
+
+> **💡 Tip:** Run `make setup` to generate this interactively!
+
+## 🤖 Bot Commands
 
 | Command | Description |
 |---|---|
-| `/start` | Introduction and quick-start guide |
+| `/start` | Welcome message and quick-start guide |
 | `/new` | Reset the current gemini-cli session |
-| `/status` | Show the number of active sessions |
-| `/help` | List all available commands |
+| `/status` | Show active session count |
+| `/help` | List all commands |
 
----
-
-## Architecture
+## 📐 Architecture
 
 ```
 src/
-├── main.rs          — entry point; Telegram dispatcher and command routing
-├── config.rs        — Config struct, loaded from environment variables
-├── session.rs       — Session (gemini-cli subprocess) and SessionManager
+├── main.rs             — entry point, dispatcher, CLI args
+├── config.rs           — Config from env vars
+├── session.rs          — gemini-cli subprocess manager
+├── setup.rs            — interactive setup wizard (--setup)
+├── transcription.rs    — Parakeet V3 engine + model download
 └── handlers/
-    ├── mod.rs       — shared helpers (session_key, truncate_for_telegram)
-    ├── message.rs   — text-message handler (streaming output)
-    └── voice.rs     — voice-message handler (Whisper → gemini-cli)
+    ├── mod.rs           — shared helpers
+    ├── message.rs       — text handler (streaming)
+    └── voice.rs         — voice handler (local → cloud fallback)
 ```
 
-Each chat/topic maps to a single long-lived `gemini-cli` subprocess.
-Queries are serialised per session via a `tokio::sync::Mutex`.
-Responses are streamed back to Telegram by editing a placeholder message every 500 ms.
+Each chat or forum topic maps to a long-lived `gemini-cli` subprocess. Queries are serialized per session via `tokio::sync::Mutex`. Responses stream back by editing a placeholder message every 500ms.
 
----
+## 🛠 Makefile
 
-## License
+```sh
+make help          # show all targets
+make build         # debug build
+make release       # optimized build
+make run           # run (debug)
+make run-release   # run (release)
+make setup         # interactive setup wizard
+make test          # run tests
+make lint          # clippy
+make fmt           # format code
+make clean         # clean artifacts
+```
+
+## 📄 License
 
 MIT — see [LICENSE](LICENSE).

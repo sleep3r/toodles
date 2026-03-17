@@ -1,5 +1,9 @@
-use anyhow::{Context, Result};
 use std::env;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+
+use crate::transcription;
 
 /// Bot configuration loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -19,6 +23,12 @@ pub struct Config {
 
     /// Optional OpenAI API key for Whisper voice transcription.
     pub openai_api_key: Option<String>,
+
+    /// Whether to use local Parakeet transcription instead of OpenAI Whisper.
+    pub use_local_transcription: bool,
+
+    /// Directory where models are stored.
+    pub models_dir: PathBuf,
 }
 
 impl Config {
@@ -40,12 +50,22 @@ impl Config {
         let gemini_working_dir = env::var("GEMINI_WORKING_DIR").ok();
         let openai_api_key = env::var("OPENAI_API_KEY").ok();
 
+        let use_local_transcription = env::var("USE_LOCAL_TRANSCRIPTION")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let models_dir = env::var("MODELS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| transcription::default_models_dir());
+
         Ok(Self {
             telegram_bot_token,
             allowed_user_ids,
             gemini_cli_path,
             gemini_working_dir,
             openai_api_key,
+            use_local_transcription,
+            models_dir,
         })
     }
 
