@@ -32,8 +32,6 @@ pub struct Session {
     yolo: bool,
     /// System prompt prepended to the first query.
     system_prompt: Option<String>,
-    /// Whether the session has been warmed up (gemini-cli initialised).
-    is_warm: bool,
 }
 
 impl Session {
@@ -50,69 +48,10 @@ impl Session {
             has_history: false,
             yolo,
             system_prompt,
-            is_warm: false,
         }
     }
 
 
-    /// Warm up the session by sending a lightweight probe query to gemini-cli.
-    ///
-    /// This forces gemini-cli to perform its slow initialisation (auth, model
-    /// loading, etc.) so that subsequent `query()` calls with `--resume latest`
-    /// are fast.
-    pub async fn warm_up(&mut self) -> Result<()> {
-        if self.is_warm {
-            return Ok(());
-        }
-
-        info!("Warming up gemini-cli session…");
-
-        // Include the system prompt in the warm-up so it's part of the
-        // session history that `--resume latest` restores.
-        let warmup_prompt = if let Some(ref sp) = self.system_prompt {
-            format!(
-                "[System instruction]: {}\n\nRespond with just the word 'ready'.",
-                sp
-            )
-        } else {
-            "Respond with just the word 'ready'.".to_string()
-        };
-
-        let mut cmd = Command::new(&self.gemini_cli_path);
-        cmd.arg("-p").arg(&warmup_prompt)
-            .arg("-o").arg("text")
-            .arg("--sandbox=false")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if self.yolo {
-            cmd.arg("--yolo");
-        }
-
-        if let Some(ref dir) = self.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        let child = cmd.spawn()
-            .with_context(|| format!("Failed to spawn '{}' for warm-up", self.gemini_cli_path))?;
-
-        let output = child.wait_with_output().await
-            .context("Failed to read gemini-cli warm-up output")?;
-
-        if !output.status.success() {
-            let stderr_hint = String::from_utf8_lossy(&output.stderr);
-            error!("gemini-cli warm-up exited with {}: {}", output.status, stderr_hint);
-        }
-
-        // Do NOT set has_history here. The warmup is just to prime gemini-cli.
-        // The first real query should start a fresh session (no --resume),
-        // so we don't replay the warmup response in stdout.
-        self.is_warm = true;
-        info!("Gemini-cli session warmed up");
-        Ok(())
-    }
 
     /// Send a prompt and stream the response line-by-line.
     ///
@@ -322,8 +261,7 @@ impl SessionManager {
         }
     }
 
-    /// Reset a session – gemini-cli manages its own session files,
-    /// so we just drop our `Session` and start fresh.
+    /// Reset a session – drop our `Session` and start fresh.
     pub async fn reset(&self, key: &SessionKey) {
         self.sessions.remove(key);
         info!("Session {:?} reset", key);

@@ -37,14 +37,13 @@ pub async fn handle_text(
     };
 
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart { text });
+    let is_first = aggregator.push(key, MessagePart { text, files: vec![] });
 
     if !is_first {
         // Another handler instance is already waiting; our part was appended.
         return Ok(());
     }
 
-    // Wait for the aggregation window, then drain.
     let combined = loop {
         if let Some(parts) = aggregator.take_if_ready(&key) {
             break MessageAggregator::combine(&parts);
@@ -55,8 +54,9 @@ pub async fn handle_text(
             None => return Ok(()), // batch was taken by another task
         }
     };
+    let (combined, combined_files) = combined;
 
-    let (session, is_new) = match sessions.get_or_create(key).await {
+    let (session, _is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
@@ -74,21 +74,19 @@ pub async fn handle_text(
         }
     };
 
-    // Warm up new sessions with an animated indicator.
-    if is_new {
-        if let Err(e) = super::warm_up_with_indicator(&bot, &msg, &session).await {
-            error!("Session warm-up failed: {e}");
-            return Ok(());
-        }
-    }
-
     let (tx, rx) = mpsc::channel::<String>(64);
 
     let session_clone = session.clone();
     tokio::spawn(async move {
         let mut sess = session_clone.lock().await;
-        if let Err(e) = sess.query(&combined, tx).await {
-            error!("Session query error: {e}");
+        if combined_files.is_empty() {
+            if let Err(e) = sess.query(&combined, tx).await {
+                error!("Session query error: {e}");
+            }
+        } else {
+            if let Err(e) = sess.query_with_files(&combined, &combined_files, tx).await {
+                error!("Session query error: {e}");
+            }
         }
     });
 

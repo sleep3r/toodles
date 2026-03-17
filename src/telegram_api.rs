@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tracing::debug;
 
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 /// Call the `sendMessageDraft` Telegram Bot API method.
 ///
 /// Streams a partial message to the user while it is being generated.
@@ -27,8 +30,7 @@ pub async fn send_message_draft(
         body["message_thread_id"] = json!(tid);
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = HTTP_CLIENT
         .post(&url)
         .json(&body)
         .send()

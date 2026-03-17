@@ -7,6 +7,7 @@ use crate::session::SessionKey;
 #[derive(Debug, Clone)]
 pub struct MessagePart {
     pub text: String,
+    pub files: Vec<String>,
 }
 
 /// Buffered state for a pending aggregation.
@@ -63,18 +64,9 @@ impl MessageAggregator {
     /// Take the aggregated parts if the deadline has passed.
     /// Returns `None` if there's still time left or no batch exists.
     pub fn take_if_ready(&self, key: &SessionKey) -> Option<Vec<MessagePart>> {
-        // Check if deadline passed.
-        let ready = self
-            .pending
-            .get(key)
-            .map(|state| Instant::now() >= state.deadline)
-            .unwrap_or(false);
-
-        if ready {
-            self.pending.remove(key).map(|(_, state)| state.parts)
-        } else {
-            None
-        }
+        self.pending
+            .remove_if(key, |_, state| Instant::now() >= state.deadline)
+            .map(|(_, state)| state.parts)
     }
 
     /// Return the remaining time until the aggregation deadline for a key.
@@ -90,9 +82,9 @@ impl MessageAggregator {
         })
     }
 
-    /// Combine message parts into a single prompt string.
-    pub fn combine(parts: &[MessagePart]) -> String {
-        if parts.len() == 1 {
+    /// Combine message parts into a single prompt string and collect file paths.
+    pub fn combine(parts: &[MessagePart]) -> (String, Vec<String>) {
+        let text = if parts.len() == 1 {
             parts[0].text.clone()
         } else {
             parts
@@ -100,7 +92,9 @@ impl MessageAggregator {
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n")
-        }
+        };
+        let files: Vec<String> = parts.iter().flat_map(|p| p.files.clone()).collect();
+        (text, files)
     }
 
     /// The aggregation window duration.
@@ -117,6 +111,7 @@ mod tests {
     fn make_part(text: &str) -> MessagePart {
         MessagePart {
             text: text.to_string(),
+            files: vec![],
         }
     }
 
@@ -181,7 +176,9 @@ mod tests {
     #[test]
     fn combine_single_part() {
         let parts = vec![make_part("only one")];
-        assert_eq!(MessageAggregator::combine(&parts), "only one");
+        let (text, files) = MessageAggregator::combine(&parts);
+        assert_eq!(text, "only one");
+        assert!(files.is_empty());
     }
 
     #[test]
@@ -191,10 +188,9 @@ mod tests {
             make_part("second"),
             make_part("third"),
         ];
-        assert_eq!(
-            MessageAggregator::combine(&parts),
-            "first\n\nsecond\n\nthird"
-        );
+        let (text, files) = MessageAggregator::combine(&parts);
+        assert_eq!(text, "first\n\nsecond\n\nthird");
+        assert!(files.is_empty());
     }
 
     #[test]

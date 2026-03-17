@@ -123,7 +123,7 @@ pub async fn handle_voice(
 
     // Reuse the text handler logic by obtaining the session and querying.
     let key = session_key(&msg);
-    let (session, is_new) = match sessions.get_or_create(key).await {
+    let (session, _is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
@@ -136,14 +136,6 @@ pub async fn handle_voice(
             return Ok(());
         }
     };
-
-    // Warm up new sessions with an animated indicator.
-    if is_new {
-        if let Err(e) = super::warm_up_with_indicator(&bot, &msg, &session).await {
-            error!("Session warm-up failed: {e}");
-            return Ok(());
-        }
-    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let session_clone = session.clone();

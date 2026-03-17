@@ -9,25 +9,21 @@ pub struct TempFileGuard(pub String);
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        let path = self.0.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(&path).await;
-        });
+        // Use sync fs to avoid panicking if Tokio runtime is shutting down.
+        std::fs::remove_file(&self.0).ok();
     }
 }
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, Message};
-use tokio::sync::Mutex;
+use teloxide::types::{ChatAction, InputFile, Message, ParseMode};
 use tracing::error;
 
 use crate::config::Config;
-use crate::session::{Session, SessionKey};
+use crate::session::SessionKey;
 use crate::telegram_api;
 
 
@@ -41,76 +37,6 @@ pub fn session_key(msg: &Message) -> SessionKey {
 }
 
 
-
-/// Show an animated "starting session" indicator in the chat while
-/// warming up gemini-cli. Edits the placeholder message with a dot
-/// animation, then shows ✅ on success or ❌ on failure.
-///
-/// Returns `Ok(())` if warm-up succeeded, or an error.
-pub async fn warm_up_with_indicator(
-    bot: &Bot,
-    msg: &Message,
-    session: &Arc<Mutex<Session>>,
-) -> Result<()> {
-    use message::send_reply;
-
-    let placeholder = send_reply(bot, msg, "Загружаю Gemini ·").await?;
-
-    // Spawn warm-up in a background task so we can animate concurrently.
-    let session_clone = session.clone();
-    let mut warmup_handle = tokio::spawn(async move {
-        let mut sess = session_clone.lock().await;
-        sess.warm_up().await
-    });
-
-    // Animate the placeholder while warm-up runs.
-    let mut tick = 0usize;
-    loop {
-        tokio::select! {
-            result = &mut warmup_handle => {
-                // Warm-up finished.
-                match result {
-                    Ok(Ok(())) => {
-                        bot.edit_message_text(
-                            msg.chat.id,
-                            placeholder.id,
-                            "✨ Готово, слушаю!",
-                        ).await.ok();
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        error!("Warm-up failed: {e}");
-                        bot.edit_message_text(
-                            msg.chat.id,
-                            placeholder.id,
-                            format!("Не удалось запуститься: {e}"),
-                        ).await.ok();
-                        return Err(e);
-                    }
-                    Err(join_err) => {
-                        error!("Warm-up task panicked: {join_err}");
-                        bot.edit_message_text(
-                            msg.chat.id,
-                            placeholder.id,
-                            "Что-то пошло не так :(",
-                        ).await.ok();
-                        anyhow::bail!("warm-up task panicked");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(1500)) => {
-                let frames = ["Загружаю Gemini ·", "Загружаю Gemini ··", "Загружаю Gemini ···"];
-                let frame = frames[tick % frames.len()];
-                tick += 1;
-                bot.edit_message_text(
-                    msg.chat.id,
-                    placeholder.id,
-                    frame,
-                ).await.ok();
-            }
-        }
-    }
-}
 
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
@@ -205,23 +131,31 @@ pub async fn stream_response_with_drafts(
 
     // Final edit — commit the complete response as a persistent message.
     let final_text = if accumulated.is_empty() {
-        "(нет ответа)".to_string()
+        "(no response)".to_string()
     } else {
         truncate_text(&accumulated)
     };
 
+    #[allow(deprecated)]
     if let Some(pid) = placeholder_id {
         bot.edit_message_text(msg.chat.id, pid, &final_text)
+            .parse_mode(ParseMode::Markdown)
             .await
             .ok();
     } else {
         // No draft was ever sent (very fast or empty response).
-        let mut req = bot.send_message(msg.chat.id, &final_text);
+        let mut req = bot.send_message(msg.chat.id, &final_text)
+            .parse_mode(ParseMode::Markdown);
         if let Some(tid) = msg.thread_id {
             req = req.message_thread_id(tid);
         }
         req.await.ok();
     }
+
+    // Clear the draft so text doesn't linger in the user's input field.
+    telegram_api::send_message_draft(token, chat_id, draft_id, "", thread_id)
+        .await
+        .ok();
 
     Ok(())
 }

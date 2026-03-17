@@ -38,7 +38,7 @@ pub async fn handle_photo(
 
     // Pick the largest resolution photo.
     let photo = photos.last().unwrap();
-    let caption = msg.caption().unwrap_or("Что на этой картинке?");
+    let caption = msg.caption().unwrap_or("What's in this image?");
 
     // Download the photo from Telegram.
     let file = bot.get_file(&photo.file.id).await?;
@@ -58,12 +58,12 @@ pub async fn handle_photo(
 
     info!("Saved photo to {file_path} ({} bytes)", photo_bytes.len());
 
-    // RAII guard ensures cleanup even on error paths.
-    let _guard = super::TempFileGuard(file_path.clone());
+    // TempFileGuard will be moved into the spawn below.
+    let guard = super::TempFileGuard(file_path.clone());
 
     // Get or create session.
     let key = session_key(&msg);
-    let (session, is_new) = match sessions.get_or_create(key).await {
+    let (session, _is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
@@ -77,14 +77,6 @@ pub async fn handle_photo(
         }
     };
 
-    // Warm up new sessions.
-    if is_new {
-        if let Err(e) = super::warm_up_with_indicator(&bot, &msg, &session).await {
-            error!("Session warm-up failed: {e}");
-            return Ok(());
-        }
-    }
-
     // Query gemini-cli with the image file path in the prompt.
     let prompt = caption.to_string();
 
@@ -92,6 +84,7 @@ pub async fn handle_photo(
     let session_clone = session.clone();
     let file_path_clone = file_path.clone();
     tokio::spawn(async move {
+        let _g = guard; // File lives as long as gemini-cli needs it.
         let mut sess = session_clone.lock().await;
         if let Err(e) = sess.query_with_files(&prompt, &[file_path_clone], tx).await {
             error!("Session query error: {e}");

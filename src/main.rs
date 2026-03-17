@@ -32,15 +32,15 @@ use transcription::LocalTranscriber;
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Вот что я умею:")]
+#[command(rename_rule = "lowercase", description = "Here's what I can do:")]
 enum Cmd {
-    #[command(description = "Познакомиться 👋")]
+    #[command(description = "Get started 👋")]
     Start,
-    #[command(description = "Начать с чистого листа 🔄")]
+    #[command(description = "Start fresh 🔄")]
     New,
-    #[command(description = "Статус бота 📊")]
+    #[command(description = "Bot status 📊")]
     Status,
-    #[command(description = "Показать команды 💡")]
+    #[command(description = "Show commands 💡")]
     Help,
 }
 
@@ -66,27 +66,27 @@ async fn command_handler(
             send_reply(
                 &bot,
                 &msg,
-                "🐩 Гав! Я — Toodles, твой AI-ассистент.\n\n\
-                 Просто напиши мне что угодно, и я отвечу! \
-                 Можешь задавать вопросы, просить помощь с кодом, переводами — чем угодно.\n\n\
-                 🎙 Голосовые сообщения тоже понимаю — расшифрую и отвечу.\n\
-                 📄 Файлы тоже принимаю — пришли документ, и я разберусь!\n\n\
-                 /new — Начать заново\n\
-                 /help — Все команды",
+                "🐩 Woof! I'm Toodles, your AI assistant.\n\n\
+                 Just write me anything and I'll respond! \
+                 Ask questions, get help with code, translations — anything.\n\n\
+                 🎙 I understand voice messages — I'll transcribe and reply.\n\
+                 📄 Send me files too — I'll figure them out!\n\n\
+                 /new — Start fresh\n\
+                 /help — All commands",
             )
             .await?;
         }
         Cmd::New => {
             let key = session_key(&msg);
             sessions.reset(&key).await;
-            send_reply(&bot, &msg, "Готово! Начинаем с чистого листа.").await?;
+            send_reply(&bot, &msg, "Done! Starting fresh.").await?;
         }
         Cmd::Status => {
             let count = sessions.session_count();
             send_reply(
                 &bot,
                 &msg,
-                &format!("📊 Активных диалогов: {count}"),
+                &format!("📊 Active sessions: {count}"),
             )
             .await?;
         }
