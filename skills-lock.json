@@ -266,6 +266,11 @@
       "sourceType": "github",
       "computedHash": "b87bc4c49f79a835afe66f383043102e9e9d85796bae23e33934c35413b360e0"
     },
+    "powerpoint-automation": {
+      "source": "aktsmm/agent-skills",
+      "sourceType": "github",
+      "computedHash": "e3f5f6a67b4e64ba5e0e204ae1cbca3366871633283e5fa0dafb1381111d355b"
+    },
     "recipe-backup-sheet-as-csv": {
       "source": "googleworkspace/cli",
       "sourceType": "github",
