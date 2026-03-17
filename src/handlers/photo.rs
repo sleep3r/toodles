@@ -7,19 +7,21 @@ use teloxide::types::Message;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::aggregator::{MessageAggregator, MessagePart};
 use crate::config::Config;
 use crate::session::SessionManager;
 
 use super::message::send_reply;
 use super::session_key;
 
-/// Handle a photo message: download the image, save it to workspace/,
-/// and pass it to gemini-cli for analysis along with the caption (if any).
+/// Handle a photo message: download the image, aggregate with album siblings,
+/// and pass to gemini-cli for analysis.
 pub async fn handle_photo(
     bot: Bot,
     msg: Message,
     config: Arc<Config>,
     sessions: Arc<SessionManager>,
+    aggregator: Arc<MessageAggregator>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0,
@@ -58,11 +60,35 @@ pub async fn handle_photo(
 
     info!("Saved photo to {file_path} ({} bytes)", photo_bytes.len());
 
-    // TempFileGuard will be moved into the spawn below.
-    let guard = super::TempFileGuard(file_path.clone());
+    // Wrap in Arc so the guard can be shared via the aggregator.
+    let guard = Arc::new(super::TempFileGuard(file_path.clone()));
 
-    // Get or create session.
+    let prompt = caption.to_string();
+
+    // Use aggregation to batch album photos into a single query.
     let key = session_key(&msg);
+    let is_first = aggregator.push(key, MessagePart {
+        text: prompt,
+        files: vec![file_path.clone()],
+        _guards: vec![guard],
+    });
+
+    if !is_first {
+        return Ok(()); // Another handler instance will drain the batch.
+    }
+
+    let combined = loop {
+        if let Some(parts) = aggregator.take_if_ready(&key) {
+            break MessageAggregator::combine(&parts);
+        }
+        match aggregator.wait_deadline(&key) {
+            Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
+            Some(_) => continue,
+            None => return Ok(()),
+        }
+    };
+    let (combined, combined_files, _guards) = combined;
+
     let (session, _is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
         Err(e) => {
@@ -77,16 +103,12 @@ pub async fn handle_photo(
         }
     };
 
-    // Query gemini-cli with the image file path in the prompt.
-    let prompt = caption.to_string();
-
     let (tx, rx) = mpsc::channel::<String>(64);
     let session_clone = session.clone();
-    let file_path_clone = file_path.clone();
     tokio::spawn(async move {
-        let _g = guard; // File lives as long as gemini-cli needs it.
+        let _g = _guards; // Keep all temp file guards alive.
         let mut sess = session_clone.lock().await;
-        if let Err(e) = sess.query_with_files(&prompt, &[file_path_clone], tx).await {
+        if let Err(e) = sess.query_with_files(&combined, &combined_files, tx).await {
             error!("Session query error: {e}");
         }
     });

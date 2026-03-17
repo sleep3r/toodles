@@ -61,13 +61,24 @@ pub async fn stream_response_with_drafts(
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
-    let mut placeholder_id: Option<teloxide::types::MessageId> = None;
     let mut last_line = String::new();
+    let mut first_content = true;
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
-
     // Show typing indicator immediately.
     bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
+
+    // Send instant placeholder so the user sees activity right away.
+    let mut placeholder_id: Option<teloxide::types::MessageId> = None;
+    {
+        let mut req = bot.send_message(msg.chat.id, "⏳");
+        if let Some(tid) = msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if let Ok(sent) = req.disable_notification(true).await {
+            placeholder_id = Some(sent.id);
+        }
+    }
 
     while let Some(line) = rx.recv().await {
         // Intercept file attachments.
@@ -86,14 +97,15 @@ pub async fn stream_response_with_drafts(
             continue;
         }
 
-        // Skip consecutive duplicate lines (gemini-cli --resume can replay history).
-        if line == last_line {
+        // Skip consecutive duplicate non-empty lines (gemini-cli --resume can replay history).
+        if line == last_line && !line.is_empty() {
             continue;
         }
         last_line = line.clone();
 
+        // Accumulate with newlines for paragraph separation.
         if !accumulated.is_empty() {
-            accumulated.push_str("\n\n");
+            accumulated.push('\n');
         }
         accumulated.push_str(&line);
 
@@ -105,17 +117,16 @@ pub async fn stream_response_with_drafts(
 
         // Stream updates via sendMessageDraft.
         if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
-            // Send a placeholder on first real content so we have a message to edit later.
-            if placeholder_id.is_none() {
-                let mut req = bot.send_message(msg.chat.id, &truncate_text(&accumulated));
-                if let Some(tid) = msg.thread_id {
-                    req = req.message_thread_id(tid);
-                }
-                if let Ok(sent) = req.disable_notification(true).await {
-                    placeholder_id = Some(sent.id);
+            // On first real content, update the placeholder with actual text.
+            if first_content {
+                first_content = false;
+                if let Some(pid) = placeholder_id {
+                    bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
+                        .await
+                        .ok();
                 }
                 last_update = Instant::now();
-                continue; // placeholder already shows text, skip draft this iteration
+                continue;
             }
 
             let draft_text = truncate_text(&accumulated);
@@ -138,18 +149,26 @@ pub async fn stream_response_with_drafts(
 
     #[allow(deprecated)]
     if let Some(pid) = placeholder_id {
-        bot.edit_message_text(msg.chat.id, pid, &final_text)
+        let edit_res = bot.edit_message_text(msg.chat.id, pid, &final_text)
             .parse_mode(ParseMode::Markdown)
-            .await
-            .ok();
-    } else {
-        // No draft was ever sent (very fast or empty response).
-        let mut req = bot.send_message(msg.chat.id, &final_text)
-            .parse_mode(ParseMode::Markdown);
-        if let Some(tid) = msg.thread_id {
-            req = req.message_thread_id(tid);
+            .await;
+        if let Err(e) = edit_res {
+            // Markdown parse error — fallback to plain text.
+            tracing::warn!("Markdown failed: {e}, falling back to plain text");
+            bot.edit_message_text(msg.chat.id, pid, &final_text).await.ok();
         }
-        req.await.ok();
+    } else {
+        // No placeholder was ever sent.
+        let send_res = bot.send_message(msg.chat.id, &final_text)
+            .parse_mode(ParseMode::Markdown)
+            .await;
+        if let Err(_) = send_res {
+            let mut req = bot.send_message(msg.chat.id, &final_text);
+            if let Some(tid) = msg.thread_id {
+                req = req.message_thread_id(tid);
+            }
+            req.await.ok();
+        }
     }
 
     // Clear the draft so text doesn't linger in the user's input field.

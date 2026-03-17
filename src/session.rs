@@ -164,9 +164,8 @@ impl Session {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
-                    if !stripped.is_empty() {
-                        let _ = tx.send(stripped).await;
-                    }
+                    // Send all lines (including empty ones for paragraph breaks).
+                    let _ = tx.send(stripped).await;
                 }
                 Err(e) => {
                     error!("Error reading gemini-cli stdout: {e}");

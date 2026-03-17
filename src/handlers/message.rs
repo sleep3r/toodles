@@ -37,7 +37,7 @@ pub async fn handle_text(
     };
 
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart { text, files: vec![] });
+    let is_first = aggregator.push(key, MessagePart { text, files: vec![], _guards: vec![] });
 
     if !is_first {
         // Another handler instance is already waiting; our part was appended.
@@ -54,7 +54,7 @@ pub async fn handle_text(
             None => return Ok(()), // batch was taken by another task
         }
     };
-    let (combined, combined_files) = combined;
+    let (combined, combined_files, _guards) = combined;
 
     let (session, _is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
@@ -78,6 +78,7 @@ pub async fn handle_text(
 
     let session_clone = session.clone();
     tokio::spawn(async move {
+        let _g = _guards; // Keep temp file guards alive.
         let mut sess = session_clone.lock().await;
         if combined_files.is_empty() {
             if let Err(e) = sess.query(&combined, tx).await {

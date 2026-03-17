@@ -1,13 +1,15 @@
 use dashmap::DashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::session::SessionKey;
 
 /// A single part of an aggregated message batch.
-#[derive(Debug, Clone)]
 pub struct MessagePart {
     pub text: String,
     pub files: Vec<String>,
+    /// RAII guards keeping temp files alive until the batch is processed.
+    pub _guards: Vec<Arc<crate::handlers::TempFileGuard>>,
 }
 
 /// Buffered state for a pending aggregation.
@@ -40,24 +42,22 @@ impl MessageAggregator {
     /// Returns `true` if this is the first part (caller should spawn the
     /// drain task), or `false` if appended to an existing batch.
     pub fn push(&self, key: SessionKey, part: MessagePart) -> bool {
-        let mut is_first = false;
-
-        self.pending
-            .entry(key)
-            .and_modify(|state| {
-                state.parts.push(part.clone());
-                // Extend the deadline slightly for each new part.
+        use dashmap::mapref::entry::Entry;
+        match self.pending.entry(key) {
+            Entry::Occupied(mut e) => {
+                let state = e.get_mut();
+                state.parts.push(part);
                 state.deadline = Instant::now() + self.window;
-            })
-            .or_insert_with(|| {
-                is_first = true;
-                AggregationState {
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(AggregationState {
                     parts: vec![part],
                     deadline: Instant::now() + self.window,
-                }
-            });
-
-        is_first
+                });
+                true
+            }
+        }
     }
 
 
@@ -82,8 +82,8 @@ impl MessageAggregator {
         })
     }
 
-    /// Combine message parts into a single prompt string and collect file paths.
-    pub fn combine(parts: &[MessagePart]) -> (String, Vec<String>) {
+    /// Combine message parts into a single prompt string, file paths, and guards.
+    pub fn combine(parts: &[MessagePart]) -> (String, Vec<String>, Vec<Arc<crate::handlers::TempFileGuard>>) {
         let text = if parts.len() == 1 {
             parts[0].text.clone()
         } else {
@@ -94,7 +94,8 @@ impl MessageAggregator {
                 .join("\n\n")
         };
         let files: Vec<String> = parts.iter().flat_map(|p| p.files.clone()).collect();
-        (text, files)
+        let guards: Vec<Arc<crate::handlers::TempFileGuard>> = parts.iter().flat_map(|p| p._guards.clone()).collect();
+        (text, files, guards)
     }
 
     /// The aggregation window duration.
@@ -112,6 +113,7 @@ mod tests {
         MessagePart {
             text: text.to_string(),
             files: vec![],
+            _guards: vec![],
         }
     }
 
@@ -176,9 +178,10 @@ mod tests {
     #[test]
     fn combine_single_part() {
         let parts = vec![make_part("only one")];
-        let (text, files) = MessageAggregator::combine(&parts);
+        let (text, files, guards) = MessageAggregator::combine(&parts);
         assert_eq!(text, "only one");
         assert!(files.is_empty());
+        assert!(guards.is_empty());
     }
 
     #[test]
@@ -188,9 +191,10 @@ mod tests {
             make_part("second"),
             make_part("third"),
         ];
-        let (text, files) = MessageAggregator::combine(&parts);
+        let (text, files, guards) = MessageAggregator::combine(&parts);
         assert_eq!(text, "first\n\nsecond\n\nthird");
         assert!(files.is_empty());
+        assert!(guards.is_empty());
     }
 
     #[test]
