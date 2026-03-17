@@ -45,17 +45,14 @@ pub async fn handle_text(
     }
 
     // Wait for the aggregation window, then drain.
-    tokio::time::sleep(aggregator.window()).await;
-
-    let combined = match aggregator.take_if_ready(&key) {
-        Some(parts) => MessageAggregator::combine(&parts),
-        None => {
-            // Deadline was extended by new messages; wait once more.
-            tokio::time::sleep(aggregator.window()).await;
-            match aggregator.take_if_ready(&key) {
-                Some(parts) => MessageAggregator::combine(&parts),
-                None => return Ok(()),
-            }
+    let combined = loop {
+        if let Some(parts) = aggregator.take_if_ready(&key) {
+            break MessageAggregator::combine(&parts);
+        }
+        match aggregator.wait_deadline(&key) {
+            Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
+            Some(_) => continue, // deadline just passed, try take again
+            None => return Ok(()), // batch was taken by another task
         }
     };
 

@@ -1,6 +1,20 @@
 pub mod document;
 pub mod message;
+pub mod photo;
 pub mod voice;
+
+/// RAII guard that deletes a temporary file when dropped.
+/// Ensures cleanup even on error/panic paths.
+pub struct TempFileGuard(pub String);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let path = self.0.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(&path).await;
+        });
+    }
+}
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +28,7 @@ use tracing::error;
 
 use crate::config::Config;
 use crate::session::{Session, SessionKey};
+use crate::telegram_api;
 
 
 /// Build the session key from a Telegram message.
@@ -99,28 +114,30 @@ pub async fn warm_up_with_indicator(
 
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
-/// Uses a single placeholder message updated via `edit_message_text`.
-/// No drafts, no fallbacks — just simple edits with rate limiting.
+/// Uses `sendMessageDraft` for animated streaming (plain text).
+/// Final response committed via `edit_message_text`.
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
-    _config: &Config,
+    config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
-    use teloxide::types::ParseMode;
+    let chat_id = msg.chat.id.0;
+    let thread_id = msg.thread_id.map(|t| t.0 .0);
+    let token = &config.telegram_bot_token;
 
-    // Send a placeholder so the user sees immediate feedback.
-    let mut req = bot.send_message(msg.chat.id, "Думаю...");
-    if let Some(tid) = msg.thread_id {
-        req = req.message_thread_id(tid);
-    }
-    let placeholder = req.disable_notification(true).await?;
+    // Unique draft_id for this response.
+    let draft_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
-    let mut last_sent_text = String::from("Думаю...");
-    const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+    let mut placeholder_id: Option<teloxide::types::MessageId> = None;
+    let mut last_line = String::new();
+    const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 
     // Show typing indicator immediately.
@@ -143,12 +160,16 @@ pub async fn stream_response_with_drafts(
             continue;
         }
 
-        if !line.is_empty() {
-            if !accumulated.is_empty() {
-                accumulated.push('\n');
-            }
-            accumulated.push_str(&line);
+        // Skip consecutive duplicate lines (gemini-cli --resume can replay history).
+        if line == last_line {
+            continue;
         }
+        last_line = line.clone();
+
+        if !accumulated.is_empty() {
+            accumulated.push_str("\n\n");
+        }
+        accumulated.push_str(&line);
 
         // Refresh typing indicator periodically.
         if last_typing.elapsed() >= TYPING_INTERVAL {
@@ -156,76 +177,62 @@ pub async fn stream_response_with_drafts(
             last_typing = Instant::now();
         }
 
-        // Update the message at most once per second.
+        // Stream updates via sendMessageDraft.
         if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
-            let html = format_html(&accumulated);
-
-            if html != last_sent_text {
-                bot.edit_message_text(msg.chat.id, placeholder.id, &html)
-                    .parse_mode(ParseMode::Html)
-                    .await
-                    .ok();
-                last_sent_text = html;
+            // Send a placeholder on first real content so we have a message to edit later.
+            if placeholder_id.is_none() {
+                let mut req = bot.send_message(msg.chat.id, &truncate_text(&accumulated));
+                if let Some(tid) = msg.thread_id {
+                    req = req.message_thread_id(tid);
+                }
+                if let Ok(sent) = req.disable_notification(true).await {
+                    placeholder_id = Some(sent.id);
+                }
+                last_update = Instant::now();
+                continue; // placeholder already shows text, skip draft this iteration
             }
+
+            let draft_text = truncate_text(&accumulated);
+            telegram_api::send_message_draft(
+                token, chat_id, draft_id, &draft_text, thread_id,
+            )
+            .await
+            .ok();
 
             last_update = Instant::now();
         }
     }
 
-    // Final edit with the complete response.
-    let final_html = if accumulated.is_empty() {
+    // Final edit — commit the complete response as a persistent message.
+    let final_text = if accumulated.is_empty() {
         "(нет ответа)".to_string()
     } else {
-        format_final_html(&accumulated)
+        truncate_text(&accumulated)
     };
 
-    bot.edit_message_text(msg.chat.id, placeholder.id, final_html)
-        .parse_mode(ParseMode::Html)
-        .await
-        .ok();
+    if let Some(pid) = placeholder_id {
+        bot.edit_message_text(msg.chat.id, pid, &final_text)
+            .await
+            .ok();
+    } else {
+        // No draft was ever sent (very fast or empty response).
+        let mut req = bot.send_message(msg.chat.id, &final_text);
+        if let Some(tid) = msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        req.await.ok();
+    }
 
     Ok(())
 }
 
-/// Escape text for Telegram HTML parse mode.
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Format text as an HTML code block for Telegram (used during streaming).
-fn format_html(text: &str) -> String {
-    let truncated = truncate_raw_for_html(text);
-    let escaped = escape_html(&truncated);
-    format!("<pre>{escaped}</pre>")
-}
-
-/// Format the final response: thinking in `<pre>`, last line as plain text.
-fn format_final_html(text: &str) -> String {
-    let truncated = truncate_raw_for_html(text);
-    let lines: Vec<&str> = truncated.lines().collect();
-    if lines.len() <= 1 {
-        // Single line — just plain text, no code block needed.
-        return escape_html(&truncated);
-    }
-    let thinking = lines[..lines.len() - 1].join("\n");
-    let answer = lines[lines.len() - 1];
-    format!(
-        "<pre>{}</pre>\n\n{}",
-        escape_html(&thinking),
-        escape_html(answer),
-    )
-}
-
-/// Helper to safely truncate raw text before HTML escaping so we don't
-/// exceed Telegram's 4096 char limit after escaping.
-pub fn truncate_raw_for_html(text: &str) -> String {
-    const MAX_RAW: usize = 3800;
-    if text.chars().count() <= MAX_RAW {
+/// Truncate text to Telegram's 4096-character limit.
+fn truncate_text(text: &str) -> String {
+    const MAX: usize = 4096;
+    if text.chars().count() <= MAX {
         text.to_string()
     } else {
-        let truncated: String = text.chars().take(MAX_RAW).collect();
+        let truncated: String = text.chars().take(MAX - 1).collect();
         format!("{truncated}…")
     }
 }
@@ -237,43 +244,33 @@ mod tests {
     #[test]
     fn truncate_short_text_unchanged() {
         let text = "Hello, world!";
-        assert_eq!(truncate_raw_for_html(text), text);
+        assert_eq!(truncate_text(text), text);
     }
 
     #[test]
     fn truncate_empty_string() {
-        assert_eq!(truncate_raw_for_html(""), "");
+        assert_eq!(truncate_text(""), "");
     }
 
     #[test]
     fn truncate_exactly_at_limit() {
-        let text: String = "a".repeat(3800);
-        assert_eq!(truncate_raw_for_html(&text), text);
+        let text: String = "a".repeat(4096);
+        assert_eq!(truncate_text(&text), text);
     }
 
     #[test]
     fn truncate_over_limit() {
-        let text: String = "a".repeat(4500);
-        let result = truncate_raw_for_html(&text);
+        let text: String = "a".repeat(5000);
+        let result = truncate_text(&text);
         assert!(result.ends_with('…'));
-        assert_eq!(result.chars().count(), 3801); // 3800 chars + 1 '…' char
+        assert_eq!(result.chars().count(), 4096);
     }
 
     #[test]
     fn truncate_unicode_characters() {
-        // Each emoji is 1 char. 4001 of them should trigger truncation.
-        let text: String = "🎉".repeat(4001);
-        let result = truncate_raw_for_html(&text);
-        let char_count = result.chars().count();
+        let text: String = "🎉".repeat(5000);
+        let result = truncate_text(&text);
         assert!(result.ends_with('…'));
-        assert_eq!(char_count, 3801);
-    }
-
-    #[test]
-    fn truncate_over_limit_with_multi_byte_chars() {
-        let text = "Привет ".repeat(600); // ~4200 chars
-        let result = truncate_raw_for_html(&text);
-        assert!(result.ends_with('…'));
-        assert!(result.chars().count() <= 3801);
+        assert_eq!(result.chars().count(), 4096);
     }
 }

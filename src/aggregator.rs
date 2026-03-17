@@ -77,6 +77,19 @@ impl MessageAggregator {
         }
     }
 
+    /// Return the remaining time until the aggregation deadline for a key.
+    /// Returns `None` if no batch exists for this key.
+    pub fn wait_deadline(&self, key: &SessionKey) -> Option<Duration> {
+        self.pending.get(key).map(|state| {
+            let now = Instant::now();
+            if state.deadline > now {
+                state.deadline - now
+            } else {
+                Duration::ZERO
+            }
+        })
+    }
+
     /// Combine message parts into a single prompt string.
     pub fn combine(parts: &[MessagePart]) -> String {
         if parts.len() == 1 {
@@ -91,6 +104,7 @@ impl MessageAggregator {
     }
 
     /// The aggregation window duration.
+    #[allow(dead_code)]
     pub fn window(&self) -> Duration {
         self.window
     }

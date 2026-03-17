@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::process::Stdio;
-use std::time::Duration;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
@@ -107,7 +106,9 @@ impl Session {
             error!("gemini-cli warm-up exited with {}: {}", output.status, stderr_hint);
         }
 
-        self.has_history = true;
+        // Do NOT set has_history here. The warmup is just to prime gemini-cli.
+        // The first real query should start a fresh session (no --resume),
+        // so we don't replay the warmup response in stdout.
         self.is_warm = true;
         info!("Gemini-cli session warmed up");
         Ok(())
@@ -116,16 +117,28 @@ impl Session {
     /// Send a prompt and stream the response line-by-line.
     ///
     /// Uses `gemini -p "prompt" -o text --sandbox=false [--yolo] [--resume latest]`.
-    /// Each line is sent through `tx` as soon as it arrives from gemini-cli.
     pub async fn query(
         &mut self,
         prompt: &str,
         tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
+        self.query_with_files(prompt, &[], tx).await
+    }
+
+    /// Send a prompt with optional file attachments and stream the response line-by-line.
+    ///
+    /// Files are passed as positional arguments to gemini-cli so it uploads them
+    /// via the Gemini API as multimodal parts.
+    pub async fn query_with_files(
+        &mut self,
+        prompt: &str,
+        file_paths: &[String],
+        tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<()> {
         debug!("Query: {}", &prompt[..prompt.len().min(80)]);
 
         // Prepend system prompt on the first query of a new session.
-        let full_prompt = if !self.has_history {
+        let mut full_prompt = if !self.has_history {
             if let Some(ref sp) = self.system_prompt {
                 format!("[System instruction]: {}\n\n{}", sp, prompt)
             } else {
@@ -135,13 +148,21 @@ impl Session {
             prompt.to_string()
         };
 
+        // Use native @{path} syntax for multimodal file injection.
+        if !file_paths.is_empty() {
+            full_prompt.push_str("\n\n");
+            for path in file_paths {
+                full_prompt.push_str(&format!("@{{{}}}\n", path));
+            }
+        }
+
         let mut cmd = Command::new(&self.gemini_cli_path);
         cmd.arg("-p").arg(&full_prompt)
             .arg("-o").arg("text")
             .arg("--sandbox=false")
-            .stdin(Stdio::null())   // prevent hangs on interactive prompts
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped()) // capture stderr for debugging
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         if self.yolo {
@@ -150,6 +171,16 @@ impl Session {
 
         if self.has_history {
             cmd.arg("--resume").arg("latest");
+        }
+
+        // Allow gemini-cli to read directories containing attached files.
+        if !file_paths.is_empty() {
+            let mut dirs: Vec<String> = file_paths.iter()
+                .filter_map(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().to_string()))
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            cmd.arg("--include-directories").arg(dirs.join(","));
         }
 
         if let Some(ref dir) = self.working_dir {
@@ -187,42 +218,37 @@ impl Session {
 
         let mut reader = tokio::io::BufReader::new(stdout);
         let mut line_buf = String::new();
-        // Timeout: if no output for 2 minutes, consider gemini-cli hung.
-        const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
         loop {
             line_buf.clear();
-            let read_result = tokio::time::timeout(
-                READ_TIMEOUT,
-                reader.read_line(&mut line_buf),
-            ).await;
-
-            match read_result {
-                Ok(Ok(0)) => break, // EOF — process finished
-                Ok(Ok(_)) => {
+            match reader.read_line(&mut line_buf).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
                     let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
                     if !stripped.is_empty() {
                         let _ = tx.send(stripped).await;
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!("Error reading gemini-cli stdout: {e}");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout — gemini-cli produced no output for 2 minutes.
-                    error!("gemini-cli read timed out after {}s, killing process", READ_TIMEOUT.as_secs());
-                    child.kill().await.ok();
-                    let _ = tx.send("⚠️ Генерация зависла и была прервана.".to_string()).await;
                     break;
                 }
             }
         }
 
-        // Wait for the process to exit (stdout is already drained).
-        let status = child.wait().await.context("Failed to wait for gemini-cli")?;
-        if !status.success() {
-            error!("gemini-cli exited with {}", status);
+        // Wait for the process to exit with a timeout to prevent deadlocks.
+        match tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await {
+            Ok(Ok(status)) if !status.success() => {
+                error!("gemini-cli exited with {}", status);
+            }
+            Ok(Err(e)) => {
+                error!("Failed to wait for gemini-cli: {e}");
+            }
+            Err(_) => {
+                error!("gemini-cli timed out after 120s! Killing process.");
+                let _ = child.kill().await;
+            }
+            _ => {}
         }
 
         // Let stderr drain.
@@ -278,20 +304,22 @@ impl SessionManager {
     /// Returns `(session, is_new)` where `is_new` is `true` when a fresh
     /// session was just created (caller should warm it up).
     pub async fn get_or_create(&self, key: SessionKey) -> Result<(Arc<Mutex<Session>>, bool)> {
-        if let Some(entry) = self.sessions.get(&key) {
-            return Ok((entry.clone(), false));
+        use dashmap::mapref::entry::Entry;
+        match self.sessions.entry(key) {
+            Entry::Occupied(e) => Ok((e.get().clone(), false)),
+            Entry::Vacant(e) => {
+                info!("Creating new gemini-cli session for {:?}", key);
+                let session = Session::new(
+                    &self.config.gemini_cli_path,
+                    self.config.gemini_working_dir.as_deref(),
+                    true, // yolo mode
+                    self.config.system_prompt.clone(),
+                );
+                let session = Arc::new(Mutex::new(session));
+                e.insert(session.clone());
+                Ok((session, true))
+            }
         }
-
-        info!("Creating new gemini-cli session for {:?}", key);
-        let session = Session::new(
-            &self.config.gemini_cli_path,
-            self.config.gemini_working_dir.as_deref(),
-            true, // yolo mode
-            self.config.system_prompt.clone(),
-        );
-        let session = Arc::new(Mutex::new(session));
-        self.sessions.insert(key, session.clone());
-        Ok((session, true))
     }
 
     /// Reset a session – gemini-cli manages its own session files,

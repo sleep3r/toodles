@@ -4,9 +4,8 @@ use tracing::debug;
 
 /// Call the `sendMessageDraft` Telegram Bot API method.
 ///
-/// This method streams a partial message to the user while it is being
-/// generated.  Changes of drafts with the same `draft_id` are animated
-/// on the client side.
+/// Streams a partial message to the user while it is being generated.
+/// Changes of drafts with the same `draft_id` are animated on the client.
 ///
 /// <https://core.telegram.org/bots/api#sendmessagedraft>
 pub async fn send_message_draft(
@@ -22,7 +21,6 @@ pub async fn send_message_draft(
         "chat_id": chat_id,
         "draft_id": draft_id,
         "text": text,
-        "parse_mode": "HTML",
     });
 
     if let Some(tid) = thread_id {

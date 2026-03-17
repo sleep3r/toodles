@@ -43,7 +43,12 @@ pub async fn handle_document(
         .clone()
         .unwrap_or_else(|| "unknown_file".to_string());
     let unique_id = &document.file.unique_id;
-    let local_path = format!("/tmp/toodles_{unique_id}_{file_name}");
+
+    let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let temp_dir = home_dir.join(".gemini/tmp/toodles");
+    tokio::fs::create_dir_all(&temp_dir).await.ok();
+    
+    let local_path = temp_dir.join(format!("toodles_{unique_id}_{file_name}")).to_string_lossy().to_string();
 
     // Download the file from Telegram.
     info!("Downloading document: {file_name} → {local_path}");
@@ -51,6 +56,9 @@ pub async fn handle_document(
     let mut dst = tokio::fs::File::create(&local_path).await?;
     bot.download_file(&file.path, &mut dst).await?;
     info!("Document saved: {local_path}");
+
+    // RAII guard ensures cleanup even on error paths.
+    let _guard = super::TempFileGuard(local_path.clone());
 
     // Build the prompt with file path and caption.
     let caption = msg
@@ -68,19 +76,15 @@ pub async fn handle_document(
         return Ok(()); // Another handler instance will drain the batch.
     }
 
-    // Wait for the aggregation window.
-    tokio::time::sleep(aggregator.window()).await;
-
-    // Drain the batch.
-    let combined = match aggregator.take_if_ready(&key) {
-        Some(parts) => MessageAggregator::combine(&parts),
-        None => {
-            // Deadline extended; wait a bit more.
-            tokio::time::sleep(aggregator.window()).await;
-            match aggregator.take_if_ready(&key) {
-                Some(parts) => MessageAggregator::combine(&parts),
-                None => return Ok(()),
-            }
+    // Wait for the aggregation window, then drain.
+    let combined = loop {
+        if let Some(parts) = aggregator.take_if_ready(&key) {
+            break MessageAggregator::combine(&parts);
+        }
+        match aggregator.wait_deadline(&key) {
+            Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
+            Some(_) => continue,
+            None => return Ok(()),
         }
     };
 

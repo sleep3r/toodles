@@ -1,6 +1,11 @@
 {
   "version": 1,
   "skills": {
+    "elite-powerpoint-designer": {
+      "source": "willem4130/claude-code-skills",
+      "sourceType": "github",
+      "computedHash": "93c18e7db1899926c8527b485858ed633f07c1f4b09930e2f32053f5bfb5ed7d"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",

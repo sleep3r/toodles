@@ -3,7 +3,7 @@ mod config;
 mod handlers;
 mod session;
 mod setup;
-// (telegram_api module removed — no longer needed)
+mod telegram_api;
 mod transcription;
 
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use config::Config;
 use handlers::{
     document::handle_document,
     message::{handle_text, send_reply},
+    photo::handle_photo,
     session_key,
     voice::handle_voice,
 };
@@ -206,7 +207,9 @@ async fn main() {
         .branch(Message::filter_voice().endpoint(handle_voice))
         // 3. Document messages (files with optional caption).
         .branch(Message::filter_document().endpoint(handle_document))
-        // 4. Plain text messages forwarded to gemini-cli.
+        // 4. Photo messages.
+        .branch(Message::filter_photo().endpoint(handle_photo))
+        // 5. Plain text messages forwarded to gemini-cli.
         .branch(Message::filter_text().endpoint(handle_text));
 
     Dispatcher::builder(bot, handler)
