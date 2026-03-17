@@ -112,19 +112,27 @@ pub async fn warm_up_with_indicator(
     }
 }
 
-/// Stream the gemini-cli response to the user via `sendMessageDraft`,
-/// handling file attachments along the way.
+/// Stream the gemini-cli response to the user, handling file attachments.
 ///
-/// When the stream ends, sends the final complete message via `send_message`.
+/// Strategy (hybrid):
+/// 1. Send a placeholder message `⏳ Thinking…`
+/// 2. Try `sendMessageDraft` for animated streaming
+/// 3. If drafts fail → fall back to `edit_message_text` on the placeholder
+/// 4. Final response → always `edit_message_text` on the placeholder
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
     config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
+    use message::send_reply;
+
     let chat_id = msg.chat.id.0;
     let thread_id = thread_id_i32(msg);
     let token = &config.telegram_bot_token;
+
+    // Always send a placeholder so the user sees immediate feedback.
+    let placeholder = send_reply(bot, msg, "⏳ Thinking…").await?;
 
     // Use a unique draft_id per response (timestamp-based).
     let draft_id = std::time::SystemTime::now()
@@ -133,13 +141,9 @@ pub async fn stream_response_with_drafts(
         .as_millis() as i64;
 
     let mut accumulated = String::new();
-    let mut last_draft = Instant::now();
-    const MIN_DRAFT_INTERVAL: Duration = Duration::from_millis(300);
-
-    // Send initial "thinking" draft.
-    telegram_api::send_message_draft(token, chat_id, draft_id, "⏳ Thinking…", thread_id)
-        .await
-        .ok();
+    let mut last_update = Instant::now();
+    let mut use_drafts = true; // optimistic; flipped on first failure
+    const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
     while let Some(line) = rx.recv().await {
         // Intercept file attachments.
@@ -172,33 +176,47 @@ pub async fn stream_response_with_drafts(
             accumulated.push_str(&line);
         }
 
-        // Send draft updates at a reasonable rate.
-        if last_draft.elapsed() >= MIN_DRAFT_INTERVAL && !accumulated.is_empty() {
+        // Send streaming updates at a reasonable rate.
+        if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
             let preview = truncate_for_telegram(&accumulated);
-            if let Err(e) = telegram_api::send_message_draft(
-                token, chat_id, draft_id, &preview, thread_id,
-            )
-            .await
-            {
-                // If sendMessageDraft fails (e.g. unsupported), fall back silently.
-                warn!("sendMessageDraft failed: {e}");
+
+            if use_drafts {
+                match telegram_api::send_message_draft(
+                    token, chat_id, draft_id, &preview, thread_id,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!("sendMessageDraft not supported, falling back to edit: {e}");
+                        use_drafts = false;
+                        // Immediate fallback edit.
+                        bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
+                            .await
+                            .ok();
+                    }
+                }
+            } else {
+                bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
+                    .await
+                    .ok();
             }
-            last_draft = Instant::now();
+
+            last_update = Instant::now();
         }
     }
 
-    // Send the final complete message (this replaces the draft).
+    // Final edit with the complete response.
     let final_text = if accumulated.is_empty() {
         "_(no response)_".to_string()
     } else {
         truncate_for_telegram(&accumulated)
     };
 
-    let mut req = bot.send_message(msg.chat.id, final_text);
-    if let Some(tid) = msg.thread_id {
-        req = req.message_thread_id(tid);
-    }
-    req.await.ok();
+    bot.edit_message_text(msg.chat.id, placeholder.id, final_text)
+        .await
+        .ok();
 
     Ok(())
 }
+

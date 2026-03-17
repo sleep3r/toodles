@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
@@ -110,10 +111,10 @@ impl Session {
         Ok(())
     }
 
-    /// Send a prompt and collect the full response.
+    /// Send a prompt and stream the response line-by-line.
     ///
     /// Uses `gemini -p "prompt" -o text --sandbox=false [--yolo] [--resume latest]`.
-    /// The response is streamed line-by-line via `tx`.
+    /// Each line is sent through `tx` as soon as it arrives from gemini-cli.
     pub async fn query(
         &mut self,
         prompt: &str,
@@ -152,25 +153,33 @@ impl Session {
             cmd.current_dir(dir);
         }
 
-        let child = cmd.spawn()
+        let mut child = cmd.spawn()
             .with_context(|| format!("Failed to spawn '{}'", self.gemini_cli_path))?;
 
-        let output = child.wait_with_output().await
-            .context("Failed to read gemini-cli output")?;
+        // Stream stdout line-by-line as gemini-cli produces output.
+        let stdout = child.stdout.take()
+            .context("Failed to capture gemini-cli stdout")?;
 
-        if !output.status.success() {
-            let stderr_hint = String::from_utf8_lossy(&output.stderr);
-            error!("gemini-cli exited with {}: {}", output.status, stderr_hint);
-        }
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut line_buf = String::new();
 
-        let response = String::from_utf8_lossy(&output.stdout);
-        debug!("Response ({} chars)", response.len());
-
-        for line in response.lines() {
-            let stripped = strip_ansi(line);
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).await
+                .context("Error reading gemini-cli stdout")?;
+            if n == 0 {
+                break; // EOF
+            }
+            let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
             if !stripped.is_empty() {
                 let _ = tx.send(stripped).await;
             }
+        }
+
+        // Wait for the process to exit (stdout is already drained).
+        let status = child.wait().await.context("Failed to wait for gemini-cli")?;
+        if !status.success() {
+            error!("gemini-cli exited with {}", status);
         }
 
         self.has_history = true;
