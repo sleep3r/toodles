@@ -22,6 +22,7 @@ pub async fn send_message_draft(
         "chat_id": chat_id,
         "draft_id": draft_id,
         "text": text,
+        "parse_mode": "HTML",
     });
 
     if let Some(tid) = thread_id {

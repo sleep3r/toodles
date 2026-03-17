@@ -78,7 +78,7 @@ async fn command_handler(
         Cmd::New => {
             let key = session_key(&msg);
             sessions.reset(&key).await;
-            send_reply(&bot, &msg, "🐩 Готово! Начинаем с чистого листа.").await?;
+            send_reply(&bot, &msg, "Готово! Начинаем с чистого листа.").await?;
         }
         Cmd::Status => {
             let count = sessions.session_count();

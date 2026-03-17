@@ -125,15 +125,18 @@ pub async fn stream_response_with_drafts(
     config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
-    use message::send_reply;
+    use teloxide::types::ParseMode;
 
     let chat_id = msg.chat.id.0;
     let thread_id = thread_id_i32(msg);
     let token = &config.telegram_bot_token;
 
     // Always send a placeholder so the user sees immediate feedback.
-    let dot_frames = ["·", "··", "···"];
-    let placeholder = send_reply(bot, msg, "·").await?;
+    let mut req = bot.send_message(msg.chat.id, "Думаю...");
+    if let Some(tid) = msg.thread_id {
+        req = req.message_thread_id(tid);
+    }
+    let placeholder = req.disable_notification(true).await?;
 
     // Use a unique draft_id per response (timestamp-based).
     let draft_id = std::time::SystemTime::now()
@@ -144,8 +147,8 @@ pub async fn stream_response_with_drafts(
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
+    let mut last_sent_text = String::from("Думаю...");
     let mut use_drafts = true; // optimistic; flipped on first failure
-    let mut update_tick: usize = 0;
     const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 
@@ -191,9 +194,13 @@ pub async fn stream_response_with_drafts(
 
         // Send streaming updates at a reasonable rate.
         if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
-            update_tick += 1;
-            let frame = dot_frames[update_tick % dot_frames.len()];
-            let preview = format_streaming_preview(&accumulated, frame);
+            let preview = format_streaming_html(&accumulated);
+
+            // Avoid editing with identical content (causes Telegram error).
+            if preview == last_sent_text {
+                last_update = Instant::now();
+                continue;
+            }
 
             if use_drafts {
                 match telegram_api::send_message_draft(
@@ -206,48 +213,58 @@ pub async fn stream_response_with_drafts(
                         warn!("sendMessageDraft not supported, falling back to edit: {e}");
                         use_drafts = false;
                         bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
+                            .parse_mode(ParseMode::Html)
                             .await
                             .ok();
                     }
                 }
             } else {
                 bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
+                    .parse_mode(ParseMode::Html)
                     .await
                     .ok();
             }
 
+            last_sent_text = preview;
             last_update = Instant::now();
         }
     }
 
-    // Final edit with the complete, nicely formatted response.
+    // Final edit with the complete, formatted response.
     let final_text = if accumulated.is_empty() {
         "(нет ответа)".to_string()
     } else {
-        format_final_response(&accumulated)
+        format_final_html(&accumulated)
     };
 
+    // Always send the final edit to ensure any pending drafts are overwritten.
     bot.edit_message_text(msg.chat.id, placeholder.id, final_text)
+        .parse_mode(ParseMode::Html)
         .await
         .ok();
 
     Ok(())
 }
 
-/// Format in-progress streaming preview: bulleted lines + animated dots.
-fn format_streaming_preview(accumulated: &str, dot_frame: &str) -> String {
-    let bulleted = accumulated
-        .lines()
-        .map(|l| format!("• {l}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = truncate_for_telegram(&bulleted);
-    format!("{text}\n\n{dot_frame}")
+/// Escape text for Telegram HTML parse mode.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-/// Format the final completed response (clean, no blockquotes).
-fn format_final_response(accumulated: &str) -> String {
-    truncate_for_telegram(accumulated)
+/// Format in-progress streaming: all lines inside a `<pre>` code block.
+fn format_streaming_html(accumulated: &str) -> String {
+    let escaped = escape_html(accumulated);
+    let html = format!("<pre>{escaped}</pre>");
+    truncate_for_telegram(&html)
+}
+
+/// Format the final response: everything in `<pre>`.
+fn format_final_html(accumulated: &str) -> String {
+    let escaped = escape_html(accumulated);
+    let html = format!("<pre>{escaped}</pre>");
+    truncate_for_telegram(&html)
 }
 
 #[cfg(test)]
