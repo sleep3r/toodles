@@ -27,3 +27,6 @@ target
 
 # Environment secrets – never commit
 .env
+
+# Gemini-cli temporary workspace
+workspace/

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::process::Stdio;
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
@@ -82,6 +83,7 @@ impl Session {
         cmd.arg("-p").arg(&warmup_prompt)
             .arg("-o").arg("text")
             .arg("--sandbox=false")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -137,8 +139,9 @@ impl Session {
         cmd.arg("-p").arg(&full_prompt)
             .arg("-o").arg("text")
             .arg("--sandbox=false")
+            .stdin(Stdio::null())   // prevent hangs on interactive prompts
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped()) // capture stderr for debugging
             .kill_on_drop(true);
 
         if self.yolo {
@@ -160,19 +163,59 @@ impl Session {
         let stdout = child.stdout.take()
             .context("Failed to capture gemini-cli stdout")?;
 
+        // Spawn a task to log stderr in the background.
+        let stderr = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            if let Some(err_stream) = stderr {
+                let mut err_reader = tokio::io::BufReader::new(err_stream);
+                let mut err_line = String::new();
+                loop {
+                    err_line.clear();
+                    match err_reader.read_line(&mut err_line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = err_line.trim();
+                            if !trimmed.is_empty() {
+                                debug!("gemini-cli stderr: {}", trimmed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+
         let mut reader = tokio::io::BufReader::new(stdout);
         let mut line_buf = String::new();
+        // Timeout: if no output for 2 minutes, consider gemini-cli hung.
+        const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
         loop {
             line_buf.clear();
-            let n = reader.read_line(&mut line_buf).await
-                .context("Error reading gemini-cli stdout")?;
-            if n == 0 {
-                break; // EOF
-            }
-            let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
-            if !stripped.is_empty() {
-                let _ = tx.send(stripped).await;
+            let read_result = tokio::time::timeout(
+                READ_TIMEOUT,
+                reader.read_line(&mut line_buf),
+            ).await;
+
+            match read_result {
+                Ok(Ok(0)) => break, // EOF — process finished
+                Ok(Ok(_)) => {
+                    let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
+                    if !stripped.is_empty() {
+                        let _ = tx.send(stripped).await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("Error reading gemini-cli stdout: {e}");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — gemini-cli produced no output for 2 minutes.
+                    error!("gemini-cli read timed out after {}s, killing process", READ_TIMEOUT.as_secs());
+                    child.kill().await.ok();
+                    let _ = tx.send("⚠️ Генерация зависла и была прервана.".to_string()).await;
+                    break;
+                }
             }
         }
 
@@ -181,6 +224,9 @@ impl Session {
         if !status.success() {
             error!("gemini-cli exited with {}", status);
         }
+
+        // Let stderr drain.
+        stderr_task.await.ok();
 
         self.has_history = true;
         Ok(())

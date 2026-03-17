@@ -3,7 +3,7 @@ mod config;
 mod handlers;
 mod session;
 mod setup;
-mod telegram_api;
+// (telegram_api module removed — no longer needed)
 mod transcription;
 
 use std::sync::Arc;

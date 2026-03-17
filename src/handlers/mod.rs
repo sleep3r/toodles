@@ -10,11 +10,11 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InputFile, Message};
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::config::Config;
 use crate::session::{Session, SessionKey};
-use crate::telegram_api;
+
 
 /// Build the session key from a Telegram message.
 ///
@@ -25,13 +25,7 @@ pub fn session_key(msg: &Message) -> SessionKey {
     (msg.chat.id.0, msg.thread_id.map(|t| t.0 .0))
 }
 
-/// Extract the raw thread ID as `Option<i32>` for API calls.
-fn thread_id_i32(msg: &Message) -> Option<i32> {
-    msg.thread_id.map(|t| t.0 .0)
-}
 
-/// Truncate text to Telegram's 4096-character message limit, appending an
-// (Removed unused truncate_for_telegram, replaced by truncate_raw_for_html below)
 
 /// Show an animated "starting session" indicator in the chat while
 /// warming up gemini-cli. Edits the placeholder message with a dot
@@ -105,45 +99,31 @@ pub async fn warm_up_with_indicator(
 
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
-/// Strategy (hybrid):
-/// 1. Send a placeholder message `⏳ Thinking…`
-/// 2. Try `sendMessageDraft` for animated streaming
-/// 3. If drafts fail → fall back to `edit_message_text` on the placeholder
-/// 4. Final response → always `edit_message_text` on the placeholder
+/// Uses a single placeholder message updated via `edit_message_text`.
+/// No drafts, no fallbacks — just simple edits with rate limiting.
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
-    config: &Config,
+    _config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
     use teloxide::types::ParseMode;
 
-    let chat_id = msg.chat.id.0;
-    let thread_id = thread_id_i32(msg);
-    let token = &config.telegram_bot_token;
-
-    // Always send a placeholder so the user sees immediate feedback.
+    // Send a placeholder so the user sees immediate feedback.
     let mut req = bot.send_message(msg.chat.id, "Думаю...");
     if let Some(tid) = msg.thread_id {
         req = req.message_thread_id(tid);
     }
     let placeholder = req.disable_notification(true).await?;
 
-    // Use a unique draft_id per response (timestamp-based).
-    let draft_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
     let mut last_sent_text = String::from("Думаю...");
-    let mut use_drafts = true; // optimistic; flipped on first failure
-    const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
+    const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 
-    // Show "typing..." indicator immediately.
+    // Show typing indicator immediately.
     bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
 
     while let Some(line) = rx.recv().await {
@@ -158,14 +138,7 @@ pub async fn stream_response_with_drafts(
                 }
                 if let Err(e) = req.await {
                     error!("Failed to send document: {e}");
-                    bot.send_message(msg.chat.id, format!("❌ Failed to send file: {e}"))
-                        .await
-                        .ok();
                 }
-            } else {
-                bot.send_message(msg.chat.id, format!("❌ File not found: {path_str}"))
-                    .await
-                    .ok();
             }
             continue;
         }
@@ -177,59 +150,36 @@ pub async fn stream_response_with_drafts(
             accumulated.push_str(&line);
         }
 
-        // Refresh typing indicator periodically (Telegram clears it after ~5s).
+        // Refresh typing indicator periodically.
         if last_typing.elapsed() >= TYPING_INTERVAL {
             bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
             last_typing = Instant::now();
         }
 
-        // Send streaming updates at a reasonable rate.
-        if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
-            let preview = format_streaming_html(&accumulated);
+        // Update the message at most once per second.
+        if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
+            let html = format_html(&accumulated);
 
-            // Avoid editing with identical content (causes Telegram error).
-            if preview == last_sent_text {
-                last_update = Instant::now();
-                continue;
-            }
-
-            if use_drafts {
-                match telegram_api::send_message_draft(
-                    token, chat_id, draft_id, &preview, thread_id,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        warn!("sendMessageDraft not supported, falling back to edit: {e}");
-                        use_drafts = false;
-                        bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                            .ok();
-                    }
-                }
-            } else {
-                bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
+            if html != last_sent_text {
+                bot.edit_message_text(msg.chat.id, placeholder.id, &html)
                     .parse_mode(ParseMode::Html)
                     .await
                     .ok();
+                last_sent_text = html;
             }
 
-            last_sent_text = preview;
             last_update = Instant::now();
         }
     }
 
-    // Final edit with the complete, formatted response.
-    let final_text = if accumulated.is_empty() {
+    // Final edit with the complete response.
+    let final_html = if accumulated.is_empty() {
         "(нет ответа)".to_string()
     } else {
         format_final_html(&accumulated)
     };
 
-    // Always send the final edit to ensure any pending drafts are overwritten.
-    bot.edit_message_text(msg.chat.id, placeholder.id, final_text)
+    bot.edit_message_text(msg.chat.id, placeholder.id, final_html)
         .parse_mode(ParseMode::Html)
         .await
         .ok();
@@ -244,20 +194,28 @@ fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Format in-progress streaming: all lines inside a `<pre>` code block.
-fn format_streaming_html(accumulated: &str) -> String {
-    // Truncate raw text first so we don't chop off the closing </pre> tag.
-    // Use a slightly smaller limit to leave room for HTML entities.
-    let truncated = truncate_raw_for_html(accumulated);
+/// Format text as an HTML code block for Telegram (used during streaming).
+fn format_html(text: &str) -> String {
+    let truncated = truncate_raw_for_html(text);
     let escaped = escape_html(&truncated);
     format!("<pre>{escaped}</pre>")
 }
 
-/// Format the final response: everything in `<pre>`.
-fn format_final_html(accumulated: &str) -> String {
-    let truncated = truncate_raw_for_html(accumulated);
-    let escaped = escape_html(&truncated);
-    format!("<pre>{escaped}</pre>")
+/// Format the final response: thinking in `<pre>`, last line as plain text.
+fn format_final_html(text: &str) -> String {
+    let truncated = truncate_raw_for_html(text);
+    let lines: Vec<&str> = truncated.lines().collect();
+    if lines.len() <= 1 {
+        // Single line — just plain text, no code block needed.
+        return escape_html(&truncated);
+    }
+    let thinking = lines[..lines.len() - 1].join("\n");
+    let answer = lines[lines.len() - 1];
+    format!(
+        "<pre>{}</pre>\n\n{}",
+        escape_html(&thinking),
+        escape_html(answer),
+    )
 }
 
 /// Helper to safely truncate raw text before HTML escaping so we don't
