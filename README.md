@@ -5,7 +5,7 @@
 <h1 align="center">toodles</h1>
 
 <p align="center">
-  <strong>Telegram × Gemini CLI — with streaming, voice & local transcription</strong>
+  <strong>Telegram × Gemini CLI — streamed responses, voice, file sharing & local transcription</strong>
 </p>
 
 <p align="center">
@@ -24,19 +24,22 @@
 
 ---
 
-A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with streaming responses, voice-message transcription (local or cloud), and per-topic session isolation.
+A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with real-time streaming, voice transcription, file sharing, and per-topic session isolation.
 
 ## ✨ Features
 
 | | Feature | Details |
 |---|---|---|
-| 💬 | **Streaming text** | Messages forwarded to gemini-cli; responses streamed back line-by-line |
+| 💬 | **Real-time streaming** | Responses streamed line-by-line as gemini-cli generates them — via `sendMessageDraft` with `edit_message_text` fallback |
+| 🚀 | **Session warm-up** | Animated `🚀 Starting Gemini session…` indicator while gemini-cli initialises |
+| 📎 | **File sharing** | Gemini can send files back to you via the `ATTACH_FILE:` protocol |
 | 🎙 | **Voice messages** | Transcribed locally via **Parakeet V3** or cloud via **OpenAI Whisper** |
 | 🧠 | **Local transcription** | Offline, no API keys — NVIDIA Parakeet ONNX (int8, ~478 MB) |
 | 📌 | **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
-| 🔄 | **Session management** | `/new` resets, `/status` shows active count |
+| 🔄 | **Session management** | `/new` starts fresh, `/status` shows active count |
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
+| 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
 
 ## 🚀 Quick Start
 
@@ -67,6 +70,21 @@ make release        # optimized build
 make run-release    # run optimized
 ```
 
+## 💬 How It Works
+
+```
+ ┌───────────┐        ┌──────────┐        ┌──────────────┐
+ │ Telegram  │───────▶│ toodles  │───────▶│  gemini-cli  │
+ │   user    │◀─ edit │  (Rust)  │◀─ pipe │  subprocess  │
+ └───────────┘  msg   └──────────┘  stdout└──────────────┘
+```
+
+1. User sends a message (text or voice)
+2. On first message, toodles warms up gemini-cli with a probe query and shows an animated indicator
+3. The actual query is streamed — each stdout line from gemini-cli is immediately forwarded to Telegram
+4. Streaming uses `sendMessageDraft` (animated typing) with automatic `edit_message_text` fallback
+5. Subsequent messages reuse the warmed session via `--resume latest`
+
 ## 🎙 Voice Transcription
 
 toodles supports two transcription backends:
@@ -88,7 +106,7 @@ toodles supports two transcription backends:
 | **Local** (Parakeet V3) | ~2-5s | Free | `--setup` downloads 478 MB model |
 | **Cloud** (Whisper API) | ~1-3s | ~$0.006/min | Requires `OPENAI_API_KEY` |
 
-The setup wizard will guide you through downloading the model. If both are enabled, local transcription is tried first with automatic cloud fallback.
+If both are enabled, local transcription is tried first with automatic cloud fallback.
 
 ## ⚙️ Configuration
 
@@ -104,6 +122,9 @@ ALLOWED_USER_IDS=123456789,987654321
 # Gemini CLI
 GEMINI_CLI_PATH=gemini                # path to binary
 GEMINI_WORKING_DIR=/path/to/project   # optional cwd
+
+# System prompt — customise the bot's personality
+SYSTEM_PROMPT=You are a helpful AI assistant. Keep answers concise.
 
 # Voice — cloud (optional fallback)
 OPENAI_API_KEY=sk-...
@@ -122,27 +143,41 @@ RUST_LOG=info
 
 | Command | Description |
 |---|---|
-| `/start` | Welcome message and quick-start guide |
-| `/new` | Reset the current gemini-cli session |
-| `/status` | Show active session count |
-| `/help` | List all commands |
+| `/start` | Приветствие и знакомство 👋 |
+| `/new` | Начать с чистого листа 🔄 |
+| `/status` | Статус бота 📊 |
+| `/help` | Показать команды 💡 |
 
 ## 📐 Architecture
 
 ```
 src/
-├── main.rs             — entry point, dispatcher, CLI args
+├── main.rs             — entry point, dispatcher, bot commands
 ├── config.rs           — Config from env vars
-├── session.rs          — gemini-cli subprocess manager
+├── session.rs          — gemini-cli subprocess: warm-up, streaming query
+├── telegram_api.rs     — raw Telegram API (sendMessageDraft)
 ├── setup.rs            — interactive setup wizard (--setup)
 ├── transcription.rs    — Parakeet V3 engine + model download
 └── handlers/
-    ├── mod.rs           — shared helpers
-    ├── message.rs       — text handler (streaming)
-    └── voice.rs         — voice handler (local → cloud fallback)
+    ├── mod.rs           — shared: warm-up indicator, draft streaming, file sending
+    ├── message.rs       — text message handler
+    └── voice.rs         — voice handler (transcribe → query)
 ```
 
-Each chat or forum topic maps to a long-lived `gemini-cli` subprocess. Queries are serialized per session via `tokio::sync::Mutex`. Responses stream back by editing a placeholder message every 500ms.
+**Session lifecycle:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> New: /new or first message
+    New --> WarmUp: probe query + animated indicator
+    WarmUp --> Ready: ✅ Session ready!
+    Ready --> Query: user message
+    Query --> Streaming: line-by-line via BufReader
+    Streaming --> Ready: response complete
+    Ready --> [*]: /new (reset)
+```
+
+Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` fallback).
 
 ## 🛠 Makefile
 
