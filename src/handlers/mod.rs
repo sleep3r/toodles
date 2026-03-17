@@ -31,16 +31,7 @@ fn thread_id_i32(msg: &Message) -> Option<i32> {
 }
 
 /// Truncate text to Telegram's 4096-character message limit, appending an
-/// ellipsis when the content is cut.
-pub fn truncate_for_telegram(text: &str) -> String {
-    const MAX: usize = 4000; // leave headroom for markdown escaping
-    if text.chars().count() <= MAX {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(MAX).collect();
-        format!("{truncated}…")
-    }
-}
+// (Removed unused truncate_for_telegram, replaced by truncate_raw_for_html below)
 
 /// Show an animated "starting session" indicator in the chat while
 /// warming up gemini-cli. Edits the placeholder message with a dot
@@ -255,16 +246,30 @@ fn escape_html(s: &str) -> String {
 
 /// Format in-progress streaming: all lines inside a `<pre>` code block.
 fn format_streaming_html(accumulated: &str) -> String {
-    let escaped = escape_html(accumulated);
-    let html = format!("<pre>{escaped}</pre>");
-    truncate_for_telegram(&html)
+    // Truncate raw text first so we don't chop off the closing </pre> tag.
+    // Use a slightly smaller limit to leave room for HTML entities.
+    let truncated = truncate_raw_for_html(accumulated);
+    let escaped = escape_html(&truncated);
+    format!("<pre>{escaped}</pre>")
 }
 
 /// Format the final response: everything in `<pre>`.
 fn format_final_html(accumulated: &str) -> String {
-    let escaped = escape_html(accumulated);
-    let html = format!("<pre>{escaped}</pre>");
-    truncate_for_telegram(&html)
+    let truncated = truncate_raw_for_html(accumulated);
+    let escaped = escape_html(&truncated);
+    format!("<pre>{escaped}</pre>")
+}
+
+/// Helper to safely truncate raw text before HTML escaping so we don't
+/// exceed Telegram's 4096 char limit after escaping.
+pub fn truncate_raw_for_html(text: &str) -> String {
+    const MAX_RAW: usize = 3800;
+    if text.chars().count() <= MAX_RAW {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(MAX_RAW).collect();
+        format!("{truncated}…")
+    }
 }
 
 #[cfg(test)]
@@ -274,43 +279,43 @@ mod tests {
     #[test]
     fn truncate_short_text_unchanged() {
         let text = "Hello, world!";
-        assert_eq!(truncate_for_telegram(text), text);
+        assert_eq!(truncate_raw_for_html(text), text);
     }
 
     #[test]
     fn truncate_empty_string() {
-        assert_eq!(truncate_for_telegram(""), "");
+        assert_eq!(truncate_raw_for_html(""), "");
     }
 
     #[test]
     fn truncate_exactly_at_limit() {
-        let text: String = "a".repeat(4000);
-        assert_eq!(truncate_for_telegram(&text), text);
+        let text: String = "a".repeat(3800);
+        assert_eq!(truncate_raw_for_html(&text), text);
     }
 
     #[test]
     fn truncate_over_limit() {
         let text: String = "a".repeat(4500);
-        let result = truncate_for_telegram(&text);
+        let result = truncate_raw_for_html(&text);
         assert!(result.ends_with('…'));
-        // 4000 'a' chars + 1 '…' char
-        assert_eq!(result.chars().count(), 4001);
+        assert_eq!(result.chars().count(), 3801); // 3800 chars + 1 '…' char
     }
 
     #[test]
     fn truncate_unicode_characters() {
         // Each emoji is 1 char. 4001 of them should trigger truncation.
         let text: String = "🎉".repeat(4001);
-        let result = truncate_for_telegram(&text);
+        let result = truncate_raw_for_html(&text);
+        let char_count = result.chars().count();
         assert!(result.ends_with('…'));
-        assert_eq!(result.chars().count(), 4001);
+        assert_eq!(char_count, 3801);
     }
 
     #[test]
-    fn truncate_mixed_unicode() {
+    fn truncate_over_limit_with_multi_byte_chars() {
         let text = "Привет ".repeat(600); // ~4200 chars
-        let result = truncate_for_telegram(&text);
+        let result = truncate_raw_for_html(&text);
         assert!(result.ends_with('…'));
-        assert!(result.chars().count() <= 4001);
+        assert!(result.chars().count() <= 3801);
     }
 }
