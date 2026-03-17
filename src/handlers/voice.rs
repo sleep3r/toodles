@@ -123,7 +123,7 @@ pub async fn handle_voice(
 
     // Reuse the text handler logic by obtaining the session and querying.
     let key = session_key(&msg);
-    let session = match sessions.get_or_create(key).await {
+    let (session, is_new) = match sessions.get_or_create(key).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
@@ -137,46 +137,26 @@ pub async fn handle_voice(
         }
     };
 
-    let placeholder = send_reply(&bot, &msg, "⏳ Thinking…").await?;
+    // Warm up new sessions with an animated indicator.
+    if is_new {
+        if let Err(e) = super::warm_up_with_indicator(&bot, &msg, &session).await {
+            error!("Session warm-up failed: {e}");
+            return Ok(());
+        }
+    }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let session_clone = session.clone();
     let transcript_clone = transcript.clone();
     tokio::spawn(async move {
         let mut sess = session_clone.lock().await;
-        if let Err(e) = sess.query_streaming(&transcript_clone, tx).await {
+        if let Err(e) = sess.query(&transcript_clone, tx).await {
             error!("Session query error: {e}");
         }
     });
 
-    let mut accumulated = String::new();
-    let mut last_edit = std::time::Instant::now();
-    const MIN_EDIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
-    while let Some(line) = rx.recv().await {
-        if !line.is_empty() {
-            if !accumulated.is_empty() {
-                accumulated.push('\n');
-            }
-            accumulated.push_str(&line);
-        }
-        if last_edit.elapsed() >= MIN_EDIT_INTERVAL && !accumulated.is_empty() {
-            let preview = super::truncate_for_telegram(&accumulated);
-            bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
-                .await
-                .ok();
-            last_edit = std::time::Instant::now();
-        }
-    }
-
-    let final_text = if accumulated.is_empty() {
-        "_(no response)_".to_string()
-    } else {
-        super::truncate_for_telegram(&accumulated)
-    };
-    bot.edit_message_text(msg.chat.id, placeholder.id, final_text)
-        .await
-        .ok();
+    // Stream the response via sendMessageDraft.
+    super::stream_response_with_drafts(&bot, &msg, &config, rx).await?;
 
     Ok(())
 }

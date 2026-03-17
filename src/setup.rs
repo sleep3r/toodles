@@ -357,10 +357,11 @@ fn ask_local_transcription() -> Result<(bool, PathBuf)> {
                 style("⬇").cyan().bold()
             );
 
-            // Run the async download in a blocking context
-            let rt = tokio::runtime::Runtime::new()
-                .context("Failed to create tokio runtime")?;
-            rt.block_on(transcription::download_model(&models_dir))?;
+            // Run the async download using the existing tokio runtime.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(transcription::download_model(&models_dir))
+            })?;
 
             println!(
                 "  {} Model ready!",

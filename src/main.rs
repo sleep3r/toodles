@@ -2,6 +2,7 @@ mod config;
 mod handlers;
 mod session;
 mod setup;
+mod telegram_api;
 mod transcription;
 
 use std::sync::Arc;
@@ -26,15 +27,15 @@ use transcription::LocalTranscriber;
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Available commands:")]
+#[command(rename_rule = "lowercase", description = "Вот что я умею:")]
 enum Cmd {
-    #[command(description = "Introduce the bot.")]
+    #[command(description = "Познакомиться 👋")]
     Start,
-    #[command(description = "Reset the current gemini-cli session.")]
+    #[command(description = "Начать с чистого листа 🔄")]
     New,
-    #[command(description = "Show active session count.")]
+    #[command(description = "Статус бота 📊")]
     Status,
-    #[command(description = "Show this help message.")]
+    #[command(description = "Показать команды 💡")]
     Help,
 }
 
@@ -60,27 +61,26 @@ async fn command_handler(
             send_reply(
                 &bot,
                 &msg,
-                "👋 Welcome to Toodles!\n\n\
-                 I'm a Telegram wrapper for gemini-cli. \
-                 Send me any message and I'll forward it to Gemini AI and stream the response back.\n\n\
-                 🎙 Voice messages are automatically transcribed via Whisper before being forwarded.\n\n\
-                 📌 Each forum topic gets its own isolated session.\n\n\
-                 /new — Start a fresh session\n\
-                 /help — Show all commands",
+                "👋 Привет! Я — Toodles, твой AI-ассистент.\n\n\
+                 Просто напиши мне что угодно, и я отвечу! \
+                 Можешь задавать вопросы, просить помощь с кодом, переводами — чем угодно.\n\n\
+                 🎙 Голосовые сообщения тоже понимаю — расшифрую и отвечу.\n\n\
+                 /new — Начать разговор заново\n\
+                 /help — Все команды",
             )
             .await?;
         }
         Cmd::New => {
             let key = session_key(&msg);
             sessions.reset(&key).await;
-            send_reply(&bot, &msg, "🔄 Session reset. Starting fresh!").await?;
+            send_reply(&bot, &msg, "🔄 Готово! Начинаем с чистого листа.").await?;
         }
         Cmd::Status => {
             let count = sessions.session_count();
             send_reply(
                 &bot,
                 &msg,
-                &format!("📊 Active sessions: {count}"),
+                &format!("📊 Активных диалогов: {count}"),
             )
             .await?;
         }
@@ -179,6 +179,14 @@ async fn main() {
         };
 
     let bot = Bot::new(&config.telegram_bot_token);
+
+    // Register commands with Telegram so they show in the command menu.
+    if let Err(e) = bot.set_my_commands(Cmd::bot_commands()).await {
+        error!("Failed to register bot commands: {e}");
+    } else {
+        info!("Bot commands registered with Telegram");
+    }
+
     let sessions = Arc::new(SessionManager::new(config.clone()));
 
     let handler = Update::filter_message()

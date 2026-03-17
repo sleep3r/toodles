@@ -29,6 +29,9 @@ pub struct Config {
 
     /// Directory where models are stored.
     pub models_dir: PathBuf,
+
+    /// System prompt prepended to the first query in each session.
+    pub system_prompt: Option<String>,
 }
 
 impl Config {
@@ -58,6 +61,17 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| transcription::default_models_dir());
 
+        let system_prompt = env::var("SYSTEM_PROMPT").ok().or_else(|| {
+            Some(
+                "You are Toodles — a versatile, friendly AI assistant in a Telegram chat. \
+                 You help with any task: answering questions, writing code, brainstorming ideas, \
+                 translating text, explaining concepts, and more. \
+                 Keep answers concise and useful. Respond in the user's language. \
+                 To send a file to the user, output a line containing only: ATTACH_FILE:/absolute/path/to/file"
+                    .to_string(),
+            )
+        });
+
         Ok(Self {
             telegram_bot_token,
             allowed_user_ids,
@@ -66,6 +80,7 @@ impl Config {
             openai_api_key,
             use_local_transcription,
             models_dir,
+            system_prompt,
         })
     }
 
