@@ -90,3 +90,52 @@ impl Config {
         self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(allowed: Vec<u64>) -> Config {
+        Config {
+            telegram_bot_token: "test_token".to_string(),
+            allowed_user_ids: allowed,
+            gemini_cli_path: "gemini".to_string(),
+            gemini_working_dir: None,
+            openai_api_key: None,
+            use_local_transcription: false,
+            models_dir: PathBuf::from("/tmp/models"),
+            system_prompt: None,
+        }
+    }
+
+    #[test]
+    fn empty_allowlist_permits_everyone() {
+        let config = test_config(vec![]);
+        assert!(config.is_user_allowed(12345));
+        assert!(config.is_user_allowed(99999));
+        assert!(config.is_user_allowed(0));
+    }
+
+    #[test]
+    fn allowlist_permits_listed_users() {
+        let config = test_config(vec![100, 200, 300]);
+        assert!(config.is_user_allowed(100));
+        assert!(config.is_user_allowed(200));
+        assert!(config.is_user_allowed(300));
+    }
+
+    #[test]
+    fn allowlist_rejects_unlisted_users() {
+        let config = test_config(vec![100, 200]);
+        assert!(!config.is_user_allowed(999));
+        assert!(!config.is_user_allowed(0));
+        assert!(!config.is_user_allowed(101));
+    }
+
+    #[test]
+    fn single_user_allowlist() {
+        let config = test_config(vec![42]);
+        assert!(config.is_user_allowed(42));
+        assert!(!config.is_user_allowed(43));
+    }
+}

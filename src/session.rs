@@ -264,9 +264,133 @@ impl SessionManager {
 mod tests {
     use super::*;
 
+    // ── strip_ansi ───────────────────────────────────────────────────────
+
     #[test]
     fn strip_ansi_removes_color_codes() {
         assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn strip_ansi_empty_string() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_only_escape_sequence() {
+        assert_eq!(strip_ansi("\x1b[0m"), "");
+    }
+
+    #[test]
+    fn strip_ansi_nested_sequences() {
+        assert_eq!(
+            strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m normal"),
+            "bold red normal"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_preserves_unicode() {
+        assert_eq!(strip_ansi("привет \x1b[32mмир\x1b[0m 🌍"), "привет мир 🌍");
+    }
+
+    #[test]
+    fn strip_ansi_256_color() {
+        // 256-color: \x1b[38;5;196m
+        assert_eq!(strip_ansi("\x1b[38;5;196mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_cursor_movement() {
+        assert_eq!(strip_ansi("\x1b[2Ahello"), "hello");
+    }
+
+    // ── SessionManager ──────────────────────────────────────────────────
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            telegram_bot_token: "test".to_string(),
+            allowed_user_ids: vec![],
+            gemini_cli_path: "echo".to_string(), // Use echo as a dummy
+            gemini_working_dir: None,
+            openai_api_key: None,
+            use_local_transcription: false,
+            models_dir: std::path::PathBuf::from("/tmp"),
+            system_prompt: Some("test prompt".to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn session_manager_create_returns_new() {
+        let mgr = SessionManager::new(test_config());
+        let key: SessionKey = (100, None);
+        let (_session, is_new) = mgr.get_or_create(key).await.unwrap();
+        assert!(is_new);
+    }
+
+    #[tokio::test]
+    async fn session_manager_get_existing_returns_not_new() {
+        let mgr = SessionManager::new(test_config());
+        let key: SessionKey = (100, None);
+        mgr.get_or_create(key).await.unwrap();
+        let (_session, is_new) = mgr.get_or_create(key).await.unwrap();
+        assert!(!is_new);
+    }
+
+    #[tokio::test]
+    async fn session_manager_different_keys_are_separate() {
+        let mgr = SessionManager::new(test_config());
+        let key_a: SessionKey = (100, None);
+        let key_b: SessionKey = (200, None);
+
+        let (_, is_new_a) = mgr.get_or_create(key_a).await.unwrap();
+        let (_, is_new_b) = mgr.get_or_create(key_b).await.unwrap();
+
+        assert!(is_new_a);
+        assert!(is_new_b);
+        assert_eq!(mgr.session_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_manager_thread_id_isolates_sessions() {
+        let mgr = SessionManager::new(test_config());
+        let key_no_thread: SessionKey = (100, None);
+        let key_with_thread: SessionKey = (100, Some(42));
+
+        mgr.get_or_create(key_no_thread).await.unwrap();
+        mgr.get_or_create(key_with_thread).await.unwrap();
+
+        assert_eq!(mgr.session_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_manager_reset_removes_session() {
+        let mgr = SessionManager::new(test_config());
+        let key: SessionKey = (100, None);
+        mgr.get_or_create(key).await.unwrap();
+        assert_eq!(mgr.session_count(), 1);
+
+        mgr.reset(&key).await;
+        assert_eq!(mgr.session_count(), 0);
+
+        // Next get_or_create should be "new" again.
+        let (_, is_new) = mgr.get_or_create(key).await.unwrap();
+        assert!(is_new);
+    }
+
+    #[tokio::test]
+    async fn session_manager_session_count() {
+        let mgr = SessionManager::new(test_config());
+        assert_eq!(mgr.session_count(), 0);
+
+        mgr.get_or_create((1, None)).await.unwrap();
+        assert_eq!(mgr.session_count(), 1);
+
+        mgr.get_or_create((2, None)).await.unwrap();
+        assert_eq!(mgr.session_count(), 2);
+
+        mgr.get_or_create((1, None)).await.unwrap(); // existing
+        assert_eq!(mgr.session_count(), 2);
     }
 }

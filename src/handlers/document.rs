@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::Message;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::aggregator::{MessageAggregator, MessagePart};
 use crate::config::Config;
@@ -12,9 +13,9 @@ use crate::session::SessionManager;
 
 use super::session_key;
 
-/// Handle a plain text message: aggregate with nearby messages, then forward
-/// to the user's gemini-cli session and stream the response back.
-pub async fn handle_text(
+/// Handle a document message: download the file, then forward the path
+/// and caption to gemini-cli.
+pub async fn handle_document(
     bot: Bot,
     msg: Message,
     config: Arc<Config>,
@@ -27,30 +28,54 @@ pub async fn handle_text(
     };
 
     if !config.is_user_allowed(user_id) {
-        send_reply(&bot, &msg, "⛔ You are not authorised to use this bot.").await?;
+        super::message::send_reply(&bot, &msg, "⛔ You are not authorised to use this bot.")
+            .await?;
         return Ok(());
     }
 
-    let text = match msg.text() {
-        Some(t) if !t.starts_with('/') => t.to_string(),
-        _ => return Ok(()),
+    let document = match msg.document() {
+        Some(d) => d,
+        None => return Ok(()),
     };
 
+    let file_name = document
+        .file_name
+        .clone()
+        .unwrap_or_else(|| "unknown_file".to_string());
+    let unique_id = &document.file.unique_id;
+    let local_path = format!("/tmp/toodles_{unique_id}_{file_name}");
+
+    // Download the file from Telegram.
+    info!("Downloading document: {file_name} → {local_path}");
+    let file = bot.get_file(&document.file.id).await?;
+    let mut dst = tokio::fs::File::create(&local_path).await?;
+    bot.download_file(&file.path, &mut dst).await?;
+    info!("Document saved: {local_path}");
+
+    // Build the prompt with file path and caption.
+    let caption = msg
+        .caption()
+        .unwrap_or("No caption provided. Describe the file contents and ask what I should do.");
+    let prompt = format!(
+        "User sent a file: {file_name} (saved at {local_path})\n\n{caption}"
+    );
+
+    // Use aggregation.
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart { text });
+    let is_first = aggregator.push(key, MessagePart { text: prompt });
 
     if !is_first {
-        // Another handler instance is already waiting; our part was appended.
-        return Ok(());
+        return Ok(()); // Another handler instance will drain the batch.
     }
 
-    // Wait for the aggregation window, then drain.
+    // Wait for the aggregation window.
     tokio::time::sleep(aggregator.window()).await;
 
+    // Drain the batch.
     let combined = match aggregator.take_if_ready(&key) {
         Some(parts) => MessageAggregator::combine(&parts),
         None => {
-            // Deadline was extended by new messages; wait once more.
+            // Deadline extended; wait a bit more.
             tokio::time::sleep(aggregator.window()).await;
             match aggregator.take_if_ready(&key) {
                 Some(parts) => MessageAggregator::combine(&parts),
@@ -63,21 +88,16 @@ pub async fn handle_text(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "❌ Could not start gemini-cli.\n\
-                     Make sure `{}` is installed and on your PATH.\n\
-                     Error: {e}",
-                    config.gemini_cli_path
-                ),
+            super::message::send_reply(
+                &bot,
+                &msg,
+                &format!("❌ Could not start gemini-cli: {e}"),
             )
             .await?;
             return Ok(());
         }
     };
 
-    // Warm up new sessions with an animated indicator.
     if is_new {
         if let Err(e) = super::warm_up_with_indicator(&bot, &msg, &session).await {
             error!("Session warm-up failed: {e}");
@@ -86,7 +106,6 @@ pub async fn handle_text(
     }
 
     let (tx, rx) = mpsc::channel::<String>(64);
-
     let session_clone = session.clone();
     tokio::spawn(async move {
         let mut sess = session_clone.lock().await;
@@ -95,21 +114,7 @@ pub async fn handle_text(
         }
     });
 
-    // Stream the response.
     super::stream_response_with_drafts(&bot, &msg, &config, rx).await?;
 
     Ok(())
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Send a message, preserving the forum topic thread if present.
-pub async fn send_reply(bot: &Bot, msg: &Message, text: &str) -> Result<Message> {
-    let mut req = bot.send_message(msg.chat.id, text);
-    if let Some(tid) = msg.thread_id {
-        req = req.message_thread_id(tid);
-    }
-    Ok(req.await?)
 }

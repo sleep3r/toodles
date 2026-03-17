@@ -1,3 +1,4 @@
+mod aggregator;
 mod config;
 mod handlers;
 mod session;
@@ -6,6 +7,7 @@ mod telegram_api;
 mod transcription;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use teloxide::prelude::*;
@@ -13,8 +15,10 @@ use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use aggregator::MessageAggregator;
 use config::Config;
 use handlers::{
+    document::handle_document,
     message::{handle_text, send_reply},
     session_key,
     voice::handle_voice,
@@ -61,11 +65,12 @@ async fn command_handler(
             send_reply(
                 &bot,
                 &msg,
-                "👋 Привет! Я — Toodles, твой AI-ассистент.\n\n\
+                "🐩 Гав! Я — Toodles, твой AI-ассистент.\n\n\
                  Просто напиши мне что угодно, и я отвечу! \
                  Можешь задавать вопросы, просить помощь с кодом, переводами — чем угодно.\n\n\
-                 🎙 Голосовые сообщения тоже понимаю — расшифрую и отвечу.\n\n\
-                 /new — Начать разговор заново\n\
+                 🎙 Голосовые сообщения тоже понимаю — расшифрую и отвечу.\n\
+                 📄 Файлы тоже принимаю — пришли документ, и я разберусь!\n\n\
+                 /new — Начать заново\n\
                  /help — Все команды",
             )
             .await?;
@@ -73,7 +78,7 @@ async fn command_handler(
         Cmd::New => {
             let key = session_key(&msg);
             sessions.reset(&key).await;
-            send_reply(&bot, &msg, "🔄 Готово! Начинаем с чистого листа.").await?;
+            send_reply(&bot, &msg, "🐩 Готово! Начинаем с чистого листа.").await?;
         }
         Cmd::Status => {
             let count = sessions.session_count();
@@ -188,6 +193,7 @@ async fn main() {
     }
 
     let sessions = Arc::new(SessionManager::new(config.clone()));
+    let aggregator = Arc::new(MessageAggregator::new(Duration::from_millis(1500)));
 
     let handler = Update::filter_message()
         // 1. Commands (must be checked before the plain-text handler).
@@ -198,11 +204,13 @@ async fn main() {
         )
         // 2. Voice messages.
         .branch(Message::filter_voice().endpoint(handle_voice))
-        // 3. Plain text messages forwarded to gemini-cli.
+        // 3. Document messages (files with optional caption).
+        .branch(Message::filter_document().endpoint(handle_document))
+        // 4. Plain text messages forwarded to gemini-cli.
         .branch(Message::filter_text().endpoint(handle_text));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config, sessions, local_transcriber])
+        .dependencies(dptree::deps![config, sessions, local_transcriber, aggregator])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

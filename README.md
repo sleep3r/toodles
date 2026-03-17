@@ -32,7 +32,9 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 |---|---|---|
 | 💬 | **Real-time streaming** | Responses streamed line-by-line as gemini-cli generates them — via `sendMessageDraft` with `edit_message_text` fallback |
 | 🚀 | **Session warm-up** | Animated `🚀 Starting Gemini session…` indicator while gemini-cli initialises |
+| 📄 | **Document handling** | Send files (PDF, XLSX, etc.) to the bot — it downloads them and forwards to gemini-cli for processing |
 | 📎 | **File sharing** | Gemini can send files back to you via the `ATTACH_FILE:` protocol |
+| 🧩 | **Message aggregation** | Sequential messages arriving within 1.5s are batched into a single prompt — handles forwarded batches and split messages |
 | 🎙 | **Voice messages** | Transcribed locally via **Parakeet V3** or cloud via **OpenAI Whisper** |
 | 🧠 | **Local transcription** | Offline, no API keys — NVIDIA Parakeet ONNX (int8, ~478 MB) |
 | 📌 | **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
@@ -40,6 +42,7 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
 | 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
+| ✅ | **Tested** | 35 unit tests covering aggregator, config, session management, and handler utilities |
 
 ## 🚀 Quick Start
 
@@ -155,12 +158,14 @@ src/
 ├── main.rs             — entry point, dispatcher, bot commands
 ├── config.rs           — Config from env vars
 ├── session.rs          — gemini-cli subprocess: warm-up, streaming query
+├── aggregator.rs       — message batching with debounce window
 ├── telegram_api.rs     — raw Telegram API (sendMessageDraft)
 ├── setup.rs            — interactive setup wizard (--setup)
 ├── transcription.rs    — Parakeet V3 engine + model download
 └── handlers/
     ├── mod.rs           — shared: warm-up indicator, draft streaming, file sending
-    ├── message.rs       — text message handler
+    ├── message.rs       — text message handler (with aggregation)
+    ├── document.rs      — document/file handler (download + query)
     └── voice.rs         — voice handler (transcribe → query)
 ```
 
@@ -177,7 +182,7 @@ stateDiagram-v2
     Ready --> [*]: /new (reset)
 ```
 
-Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` fallback).
+Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` fallback). Sequential messages are aggregated via a 1.5s debounce window before querying.
 
 ## 🛠 Makefile
 

@@ -1,3 +1,4 @@
+pub mod document;
 pub mod message;
 pub mod voice;
 
@@ -53,7 +54,7 @@ pub async fn warm_up_with_indicator(
 ) -> Result<()> {
     use message::send_reply;
 
-    let placeholder = send_reply(bot, msg, "🚀 Starting Gemini session…").await?;
+    let placeholder = send_reply(bot, msg, "🐩 Загружаю Gemini…").await?;
 
     // Spawn warm-up in a background task so we can animate concurrently.
     let session_clone = session.clone();
@@ -63,7 +64,6 @@ pub async fn warm_up_with_indicator(
     });
 
     // Animate the placeholder while warm-up runs.
-    let dots = [".", "..", "..."];
     let mut tick = 0usize;
     loop {
         tokio::select! {
@@ -74,7 +74,7 @@ pub async fn warm_up_with_indicator(
                         bot.edit_message_text(
                             msg.chat.id,
                             placeholder.id,
-                            "✅ Session ready!",
+                            "✨ Готово, слушаю!",
                         ).await.ok();
                         return Ok(());
                     }
@@ -83,7 +83,7 @@ pub async fn warm_up_with_indicator(
                         bot.edit_message_text(
                             msg.chat.id,
                             placeholder.id,
-                            format!("❌ Failed to start session: {e}"),
+                            format!("🐩💔 Не удалось запуститься: {e}"),
                         ).await.ok();
                         return Err(e);
                     }
@@ -92,7 +92,7 @@ pub async fn warm_up_with_indicator(
                         bot.edit_message_text(
                             msg.chat.id,
                             placeholder.id,
-                            "❌ Warm-up task crashed",
+                            "🐩💔 Что-то пошло не так",
                         ).await.ok();
                         anyhow::bail!("warm-up task panicked");
                     }
@@ -100,12 +100,13 @@ pub async fn warm_up_with_indicator(
             }
             _ = tokio::time::sleep(Duration::from_millis(1500)) => {
                 // Update the animation.
-                let suffix = dots[tick % dots.len()];
+                let paws = ["🐩", "🐩·", "🐩··", "🐩···"];
+                let suffix = paws[tick % paws.len()];
                 tick += 1;
                 bot.edit_message_text(
                     msg.chat.id,
                     placeholder.id,
-                    format!("🚀 Starting Gemini session{suffix}"),
+                    format!("Загружаю Gemini {suffix}"),
                 ).await.ok();
             }
         }
@@ -132,7 +133,8 @@ pub async fn stream_response_with_drafts(
     let token = &config.telegram_bot_token;
 
     // Always send a placeholder so the user sees immediate feedback.
-    let placeholder = send_reply(bot, msg, "⏳ Thinking…").await?;
+    let thinking_frames = ["🐩 Думаю", "🐩 Думаю.", "🐩 Думаю..", "🐩 Думаю..."];
+    let placeholder = send_reply(bot, msg, thinking_frames[0]).await?;
 
     // Use a unique draft_id per response (timestamp-based).
     let draft_id = std::time::SystemTime::now()
@@ -143,6 +145,7 @@ pub async fn stream_response_with_drafts(
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut use_drafts = true; // optimistic; flipped on first failure
+    let mut update_tick: usize = 0;
     const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
     while let Some(line) = rx.recv().await {
@@ -178,7 +181,10 @@ pub async fn stream_response_with_drafts(
 
         // Send streaming updates at a reasonable rate.
         if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
-            let preview = truncate_for_telegram(&accumulated);
+            // Format the preview with a typing indicator.
+            let frame = thinking_frames[update_tick % thinking_frames.len()];
+            update_tick += 1;
+            let preview = format_streaming_preview(&accumulated, frame);
 
             if use_drafts {
                 match telegram_api::send_message_draft(
@@ -190,7 +196,6 @@ pub async fn stream_response_with_drafts(
                     Err(e) => {
                         warn!("sendMessageDraft not supported, falling back to edit: {e}");
                         use_drafts = false;
-                        // Immediate fallback edit.
                         bot.edit_message_text(msg.chat.id, placeholder.id, &preview)
                             .await
                             .ok();
@@ -206,11 +211,11 @@ pub async fn stream_response_with_drafts(
         }
     }
 
-    // Final edit with the complete response.
+    // Final edit with the complete, nicely formatted response.
     let final_text = if accumulated.is_empty() {
-        "_(no response)_".to_string()
+        "🐩 _(нет ответа)_".to_string()
     } else {
-        truncate_for_telegram(&accumulated)
+        format_final_response(&accumulated)
     };
 
     bot.edit_message_text(msg.chat.id, placeholder.id, final_text)
@@ -220,3 +225,62 @@ pub async fn stream_response_with_drafts(
     Ok(())
 }
 
+/// Format in-progress streaming preview with a typing indicator.
+fn format_streaming_preview(accumulated: &str, thinking_frame: &str) -> String {
+    let text = truncate_for_telegram(accumulated);
+    // Show response so far + animated thinking indicator at the bottom.
+    format!("{text}\n\n_{thinking_frame}_")
+}
+
+/// Format the final completed response.
+fn format_final_response(accumulated: &str) -> String {
+    truncate_for_telegram(accumulated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_text_unchanged() {
+        let text = "Hello, world!";
+        assert_eq!(truncate_for_telegram(text), text);
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_for_telegram(""), "");
+    }
+
+    #[test]
+    fn truncate_exactly_at_limit() {
+        let text: String = "a".repeat(4000);
+        assert_eq!(truncate_for_telegram(&text), text);
+    }
+
+    #[test]
+    fn truncate_over_limit() {
+        let text: String = "a".repeat(4500);
+        let result = truncate_for_telegram(&text);
+        assert!(result.ends_with('…'));
+        // 4000 'a' chars + 1 '…' char
+        assert_eq!(result.chars().count(), 4001);
+    }
+
+    #[test]
+    fn truncate_unicode_characters() {
+        // Each emoji is 1 char. 4001 of them should trigger truncation.
+        let text: String = "🎉".repeat(4001);
+        let result = truncate_for_telegram(&text);
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), 4001);
+    }
+
+    #[test]
+    fn truncate_mixed_unicode() {
+        let text = "Привет ".repeat(600); // ~4200 chars
+        let result = truncate_for_telegram(&text);
+        assert!(result.ends_with('…'));
+        assert!(result.chars().count() <= 4001);
+    }
+}
