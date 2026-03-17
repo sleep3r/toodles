@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, Message};
+use teloxide::types::{ChatAction, InputFile, Message};
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
@@ -133,8 +133,8 @@ pub async fn stream_response_with_drafts(
     let token = &config.telegram_bot_token;
 
     // Always send a placeholder so the user sees immediate feedback.
-    let thinking_frames = ["🐩 Думаю", "🐩 Думаю.", "🐩 Думаю..", "🐩 Думаю..."];
-    let placeholder = send_reply(bot, msg, thinking_frames[0]).await?;
+    let poodle_frames = ["🐩", "🐩·", "🐩··", "🐩···"];
+    let placeholder = send_reply(bot, msg, poodle_frames[0]).await?;
 
     // Use a unique draft_id per response (timestamp-based).
     let draft_id = std::time::SystemTime::now()
@@ -144,9 +144,14 @@ pub async fn stream_response_with_drafts(
 
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
+    let mut last_typing = Instant::now();
     let mut use_drafts = true; // optimistic; flipped on first failure
     let mut update_tick: usize = 0;
     const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
+    const TYPING_INTERVAL: Duration = Duration::from_secs(4);
+
+    // Show "typing..." indicator immediately.
+    bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
 
     while let Some(line) = rx.recv().await {
         // Intercept file attachments.
@@ -179,11 +184,16 @@ pub async fn stream_response_with_drafts(
             accumulated.push_str(&line);
         }
 
+        // Refresh typing indicator periodically (Telegram clears it after ~5s).
+        if last_typing.elapsed() >= TYPING_INTERVAL {
+            bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
+            last_typing = Instant::now();
+        }
+
         // Send streaming updates at a reasonable rate.
         if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
-            // Format the preview with a typing indicator.
-            let frame = thinking_frames[update_tick % thinking_frames.len()];
             update_tick += 1;
+            let frame = poodle_frames[update_tick % poodle_frames.len()];
             let preview = format_streaming_preview(&accumulated, frame);
 
             if use_drafts {
@@ -225,14 +235,18 @@ pub async fn stream_response_with_drafts(
     Ok(())
 }
 
-/// Format in-progress streaming preview with a typing indicator.
-fn format_streaming_preview(accumulated: &str, thinking_frame: &str) -> String {
-    let text = truncate_for_telegram(accumulated);
-    // Show response so far + animated thinking indicator at the bottom.
-    format!("{text}\n\n_{thinking_frame}_")
+/// Format in-progress streaming preview: lines as blockquotes + poodle dots.
+fn format_streaming_preview(accumulated: &str, poodle_frame: &str) -> String {
+    let quoted = accumulated
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = truncate_for_telegram(&quoted);
+    format!("{text}\n\n{poodle_frame}")
 }
 
-/// Format the final completed response.
+/// Format the final completed response (clean, no blockquotes).
 fn format_final_response(accumulated: &str) -> String {
     truncate_for_telegram(accumulated)
 }
