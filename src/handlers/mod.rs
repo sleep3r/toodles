@@ -54,7 +54,7 @@ pub async fn warm_up_with_indicator(
 ) -> Result<()> {
     use message::send_reply;
 
-    let placeholder = send_reply(bot, msg, "🐩 Загружаю Gemini…").await?;
+    let placeholder = send_reply(bot, msg, "Загружаю Gemini ·").await?;
 
     // Spawn warm-up in a background task so we can animate concurrently.
     let session_clone = session.clone();
@@ -83,7 +83,7 @@ pub async fn warm_up_with_indicator(
                         bot.edit_message_text(
                             msg.chat.id,
                             placeholder.id,
-                            format!("🐩💔 Не удалось запуститься: {e}"),
+                            format!("Не удалось запуститься: {e}"),
                         ).await.ok();
                         return Err(e);
                     }
@@ -92,21 +92,20 @@ pub async fn warm_up_with_indicator(
                         bot.edit_message_text(
                             msg.chat.id,
                             placeholder.id,
-                            "🐩💔 Что-то пошло не так",
+                            "Что-то пошло не так :(",
                         ).await.ok();
                         anyhow::bail!("warm-up task panicked");
                     }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(1500)) => {
-                // Update the animation.
-                let paws = ["🐩", "🐩·", "🐩··", "🐩···"];
-                let suffix = paws[tick % paws.len()];
+                let frames = ["Загружаю Gemini ·", "Загружаю Gemini ··", "Загружаю Gemini ···"];
+                let frame = frames[tick % frames.len()];
                 tick += 1;
                 bot.edit_message_text(
                     msg.chat.id,
                     placeholder.id,
-                    format!("Загружаю Gemini {suffix}"),
+                    frame,
                 ).await.ok();
             }
         }
@@ -133,8 +132,8 @@ pub async fn stream_response_with_drafts(
     let token = &config.telegram_bot_token;
 
     // Always send a placeholder so the user sees immediate feedback.
-    let poodle_frames = ["🐩", "🐩·", "🐩··", "🐩···"];
-    let placeholder = send_reply(bot, msg, poodle_frames[0]).await?;
+    let dot_frames = ["·", "··", "···"];
+    let placeholder = send_reply(bot, msg, "·").await?;
 
     // Use a unique draft_id per response (timestamp-based).
     let draft_id = std::time::SystemTime::now()
@@ -193,7 +192,7 @@ pub async fn stream_response_with_drafts(
         // Send streaming updates at a reasonable rate.
         if last_update.elapsed() >= MIN_UPDATE_INTERVAL && !accumulated.is_empty() {
             update_tick += 1;
-            let frame = poodle_frames[update_tick % poodle_frames.len()];
+            let frame = dot_frames[update_tick % dot_frames.len()];
             let preview = format_streaming_preview(&accumulated, frame);
 
             if use_drafts {
@@ -223,7 +222,7 @@ pub async fn stream_response_with_drafts(
 
     // Final edit with the complete, nicely formatted response.
     let final_text = if accumulated.is_empty() {
-        "🐩 _(нет ответа)_".to_string()
+        "(нет ответа)".to_string()
     } else {
         format_final_response(&accumulated)
     };
@@ -235,15 +234,15 @@ pub async fn stream_response_with_drafts(
     Ok(())
 }
 
-/// Format in-progress streaming preview: lines as blockquotes + poodle dots.
-fn format_streaming_preview(accumulated: &str, poodle_frame: &str) -> String {
-    let quoted = accumulated
+/// Format in-progress streaming preview: bulleted lines + animated dots.
+fn format_streaming_preview(accumulated: &str, dot_frame: &str) -> String {
+    let bulleted = accumulated
         .lines()
-        .map(|l| format!("> {l}"))
+        .map(|l| format!("• {l}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let text = truncate_for_telegram(&quoted);
-    format!("{text}\n\n{poodle_frame}")
+    let text = truncate_for_telegram(&bulleted);
+    format!("{text}\n\n{dot_frame}")
 }
 
 /// Format the final completed response (clean, no blockquotes).
