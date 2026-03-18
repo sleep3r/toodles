@@ -376,4 +376,56 @@ mod tests {
         assert!(result.ends_with('…'));
         assert_eq!(result.chars().count(), 4096);
     }
+
+    #[test]
+    fn format_inline_bold() {
+        assert_eq!(format_inline("**bold text**"), "<b>bold text</b>");
+        assert_eq!(format_inline("some **bold text** here"), "some <b>bold text</b> here");
+    }
+
+    #[test]
+    fn format_inline_italic() {
+        assert_eq!(format_inline("*italic text*"), "<i>italic text</i>");
+        assert_eq!(format_inline("some *italic text* here"), "some <i>italic text</i> here");
+    }
+
+    #[test]
+    fn format_inline_code() {
+        assert_eq!(format_inline("`code block`"), "<code>code block</code>");
+        assert_eq!(format_inline("some `code block` here"), "some <code>code block</code> here");
+    }
+
+    #[test]
+    fn format_inline_link() {
+        assert_eq!(format_inline("[OpenAI](https://openai.com)"), "<a href=\"https://openai.com\">OpenAI</a>");
+        assert_eq!(format_inline("check [this](http://example.com) link"), "check <a href=\"http://example.com\">this</a> link");
+    }
+
+    #[test]
+    fn format_inline_multiple() {
+        assert_eq!(
+            format_inline("**bold** and *italic* and `code`"),
+            "<b>bold</b> and <i>italic</i> and <code>code</code>"
+        );
+        assert_eq!(
+            format_inline("[link](url) with **bold**"),
+            "<a href=\"url\">link</a> with <b>bold</b>"
+        );
+    }
+
+    #[test]
+    fn format_inline_unclosed() {
+        assert_eq!(format_inline("**unclosed bold"), "<i></i>unclosed bold");
+        assert_eq!(format_inline("*unclosed italic"), "*unclosed italic");
+        assert_eq!(format_inline("`unclosed code"), "`unclosed code");
+        assert_eq!(format_inline("[unclosed link(url)"), "[unclosed link(url)");
+        assert_eq!(format_inline("[text](unclosed url"), "[text](unclosed url");
+    }
+
+    #[test]
+    fn format_inline_nested() {
+        // Based on the simple parser logic, it handles tags linearly,
+        // but let's test how it handles a mix
+        assert_eq!(format_inline("**bold *italic***"), "<b>bold *italic</b>*");
+    }
 }
