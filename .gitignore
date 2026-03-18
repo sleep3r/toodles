@@ -30,3 +30,11 @@ target
 
 # Gemini-cli temporary workspace
 workspace/
+
+# AI agent configs
+.agent/
+.agents/
+_agent/
+_agents/
+.claude/
+GEMINI.md

@@ -11,6 +11,7 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
 /// Changes of drafts with the same `draft_id` are animated on the client.
 ///
 /// <https://core.telegram.org/bots/api#sendmessagedraft>
+#[allow(dead_code)]
 pub async fn send_message_draft(
     token: &str,
     chat_id: i64,

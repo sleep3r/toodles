@@ -24,7 +24,6 @@ use tracing::error;
 
 use crate::config::Config;
 use crate::session::SessionKey;
-use crate::telegram_api;
 
 
 /// Build the session key from a Telegram message.
@@ -40,29 +39,18 @@ pub fn session_key(msg: &Message) -> SessionKey {
 
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
-/// Uses `sendMessageDraft` for animated streaming (plain text).
-/// Final response committed via `edit_message_text`.
+/// Edits a placeholder message in-place as lines arrive.
+/// Final response committed with HTML formatting.
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
-    config: &Config,
+    _config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
-    let chat_id = msg.chat.id.0;
-    let thread_id = msg.thread_id.map(|t| t.0 .0);
-    let token = &config.telegram_bot_token;
-
-    // Unique draft_id for this response.
-    let draft_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
     let mut last_line = String::new();
-    let mut first_content = true;
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
     // Show typing indicator immediately.
@@ -115,27 +103,13 @@ pub async fn stream_response_with_drafts(
             last_typing = Instant::now();
         }
 
-        // Stream updates via sendMessageDraft.
+        // Stream updates by editing the placeholder message.
         if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
-            // On first real content, update the placeholder with actual text.
-            if first_content {
-                first_content = false;
-                if let Some(pid) = placeholder_id {
-                    bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
-                        .await
-                        .ok();
-                }
-                last_update = Instant::now();
-                continue;
+            if let Some(pid) = placeholder_id {
+                bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
+                    .await
+                    .ok();
             }
-
-            let draft_text = truncate_text(&accumulated);
-            telegram_api::send_message_draft(
-                token, chat_id, draft_id, &draft_text, thread_id,
-            )
-            .await
-            .ok();
-
             last_update = Instant::now();
         }
     }
@@ -172,11 +146,6 @@ pub async fn stream_response_with_drafts(
             req.await.ok();
         }
     }
-
-    // Clear the draft so text doesn't linger in the user's input field.
-    telegram_api::send_message_draft(token, chat_id, draft_id, "", thread_id)
-        .await
-        .ok();
 
     Ok(())
 }
