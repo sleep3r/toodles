@@ -144,26 +144,28 @@ pub async fn stream_response_with_drafts(
     let final_text = if accumulated.is_empty() {
         "(no response)".to_string()
     } else {
-        truncate_text(&accumulated)
+        let html = markdown_to_telegram_html(&accumulated);
+        truncate_text(&html)
     };
 
-    #[allow(deprecated)]
     if let Some(pid) = placeholder_id {
         let edit_res = bot.edit_message_text(msg.chat.id, pid, &final_text)
-            .parse_mode(ParseMode::Markdown)
+            .parse_mode(ParseMode::Html)
             .await;
         if let Err(e) = edit_res {
-            // Markdown parse error — fallback to plain text.
-            tracing::warn!("Markdown failed: {e}, falling back to plain text");
-            bot.edit_message_text(msg.chat.id, pid, &final_text).await.ok();
+            // HTML parse error — fallback to plain text.
+            tracing::warn!("HTML format failed: {e}, falling back to plain text");
+            let plain = truncate_text(&accumulated);
+            bot.edit_message_text(msg.chat.id, pid, &plain).await.ok();
         }
     } else {
         // No placeholder was ever sent.
         let send_res = bot.send_message(msg.chat.id, &final_text)
-            .parse_mode(ParseMode::Markdown)
+            .parse_mode(ParseMode::Html)
             .await;
         if let Err(_) = send_res {
-            let mut req = bot.send_message(msg.chat.id, &final_text);
+            let plain = truncate_text(&accumulated);
+            let mut req = bot.send_message(msg.chat.id, &plain);
             if let Some(tid) = msg.thread_id {
                 req = req.message_thread_id(tid);
             }
@@ -177,6 +179,185 @@ pub async fn stream_response_with_drafts(
         .ok();
 
     Ok(())
+}
+
+/// Convert standard Markdown (as emitted by gemini-cli) to Telegram-compatible HTML.
+///
+/// Telegram supports: `<b>`, `<i>`, `<code>`, `<pre>`, `<a href="...">`, `<s>`, `<blockquote>`.
+/// Standard Markdown features like `###` headers or `* ` bullets are NOT supported natively.
+fn markdown_to_telegram_html(md: &str) -> String {
+    let mut out = String::with_capacity(md.len() + 256);
+    let mut in_code_block = false;
+    #[allow(unused_assignments)]
+    let mut code_lang = String::new();
+
+    for line in md.split('\n') {
+        // Toggle fenced code blocks (``` or ```rust)
+        if line.starts_with("```") {
+            if in_code_block {
+                out.push_str("</code></pre>\n");
+                in_code_block = false;
+            } else {
+                code_lang = line.trim_start_matches('`').trim().to_string();
+                if code_lang.is_empty() {
+                    out.push_str("<pre><code>");
+                } else {
+                    out.push_str(&format!("<pre><code class=\"language-{code_lang}\">"));
+                }
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            // Inside code blocks: only escape HTML entities, no formatting.
+            out.push_str(&escape_html(line));
+            out.push('\n');
+            continue;
+        }
+
+        // Headers → bold text
+        let processed = if let Some(header) = line.strip_prefix("### ") {
+            format!("\n<b>{}</b>", escape_html(header.trim()))
+        } else if let Some(header) = line.strip_prefix("## ") {
+            format!("\n<b>{}</b>", escape_html(header.trim()))
+        } else if let Some(header) = line.strip_prefix("# ") {
+            format!("\n<b>{}</b>", escape_html(header.trim()))
+        }
+        // Bullet lists → •
+        else if let Some(rest) = line.strip_prefix("* ") {
+            format!("• {}", format_inline(&escape_html(rest)))
+        } else if let Some(rest) = line.strip_prefix("- ") {
+            format!("• {}", format_inline(&escape_html(rest)))
+        }
+        // Numbered lists — pass through with inline formatting
+        else if line.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && line.contains(". ")
+        {
+            format_inline(&escape_html(line))
+        }
+        // Horizontal rules
+        else if line.trim() == "---" || line.trim() == "***" {
+            "—————".to_string()
+        }
+        // Blockquotes
+        else if let Some(rest) = line.strip_prefix("> ") {
+            format!("<blockquote>{}</blockquote>", format_inline(&escape_html(rest)))
+        }
+        // Regular text
+        else {
+            format_inline(&escape_html(line))
+        };
+
+        out.push_str(&processed);
+        out.push('\n');
+    }
+
+    // Close unclosed code block
+    if in_code_block {
+        out.push_str("</code></pre>\n");
+    }
+
+    // Trim trailing newlines
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Escape HTML special characters.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Apply inline Markdown formatting to already-escaped HTML text.
+/// Handles: **bold**, *italic*, `code`, [text](url)
+fn format_inline(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code: `text`
+        if chars[i] == '`' {
+            if let Some(end) = find_closing(&chars, i + 1, '`') {
+                result.push_str("<code>");
+                let code: String = chars[i + 1..end].iter().collect();
+                result.push_str(&code);
+                result.push_str("</code>");
+                i = end + 1;
+                continue;
+            }
+        }
+        // Bold: **text**
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double_closing(&chars, i + 2, '*') {
+                result.push_str("<b>");
+                let inner: String = chars[i + 2..end].iter().collect();
+                result.push_str(&inner);
+                result.push_str("</b>");
+                i = end + 2;
+                continue;
+            }
+        }
+        // Italic: *text* (single asterisk, not at start of bullet)
+        if chars[i] == '*' && i + 1 < len && chars[i + 1] != ' ' {
+            if let Some(end) = find_closing(&chars, i + 1, '*') {
+                result.push_str("<i>");
+                let inner: String = chars[i + 1..end].iter().collect();
+                result.push_str(&inner);
+                result.push_str("</i>");
+                i = end + 1;
+                continue;
+            }
+        }
+        // Links: [text](url)
+        if chars[i] == '[' {
+            if let Some((text_end, url_start, url_end)) = find_link(&chars, i) {
+                let link_text: String = chars[i + 1..text_end].iter().collect();
+                let url: String = chars[url_start..url_end].iter().collect();
+                result.push_str(&format!("<a href=\"{url}\">{link_text}</a>"));
+                i = url_end + 1;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
+    for i in start..chars.len() {
+        if chars[i] == marker {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_double_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
+    for i in start..chars.len().saturating_sub(1) {
+        if chars[i] == marker && chars[i + 1] == marker {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
+    // Find ]( after [
+    let text_end = find_closing(chars, start + 1, ']')?;
+    if text_end + 1 < chars.len() && chars[text_end + 1] == '(' {
+        let url_start = text_end + 2;
+        let url_end = find_closing(chars, url_start, ')')?;
+        Some((text_end, url_start, url_end))
+    } else {
+        None
+    }
 }
 
 /// Truncate text to Telegram's 4096-character limit.
