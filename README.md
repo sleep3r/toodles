@@ -5,7 +5,7 @@
 <h1 align="center">toodles</h1>
 
 <p align="center">
-  <strong>Telegram × Gemini CLI — streamed responses, voice, file sharing & local transcription</strong>
+  <strong>Telegram × Gemini CLI — streamed responses, voice, file & photo sharing, local transcription</strong>
 </p>
 
 <p align="center">
@@ -24,17 +24,18 @@
 
 ---
 
-A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with real-time streaming, voice transcription, file sharing, and per-topic session isolation.
+A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/google-gemini/gemini-cli), letting you chat with Gemini AI directly from Telegram — with real-time streaming, voice transcription, photo & file analysis, and per-topic session isolation.
 
 ## ✨ Features
 
 | | Feature | Details |
 |---|---|---|
-| 💬 | **Real-time streaming** | Responses streamed line-by-line as gemini-cli generates them — via `sendMessageDraft` with `edit_message_text` fallback |
-| 🚀 | **Session warm-up** | Animated `🚀 Starting Gemini session…` indicator while gemini-cli initialises |
-| 📄 | **Document handling** | Send files (PDF, XLSX, etc.) to the bot — it downloads them and forwards to gemini-cli for processing |
-| 📎 | **File sharing** | Gemini can send files back to you via the `ATTACH_FILE:` protocol |
-| 🧩 | **Message aggregation** | Sequential messages arriving within 1.5s are batched into a single prompt — handles forwarded batches and split messages |
+| 💬 | **Real-time streaming** | Responses streamed line-by-line via `sendMessageDraft` with Markdown formatting and plain-text fallback |
+| ⏳ | **Instant feedback** | "⏳" placeholder sent immediately — no dead silence while gemini-cli starts |
+| 📷 | **Photo analysis** | Send photos (including albums) — batched via aggregator and analyzed by Gemini Vision |
+| 📄 | **Document handling** | Send files (PDF, XLSX, etc.) — downloaded and forwarded to gemini-cli for processing |
+| 📎 | **File sharing** | Gemini can send files back via the `ATTACH_FILE:` protocol |
+| 🧩 | **Message aggregation** | Sequential messages within 1.5s are batched into a single prompt — handles albums, forwarded batches, and split messages |
 | 🎙 | **Voice messages** | Transcribed locally via **Parakeet V3** or cloud via **OpenAI Whisper** |
 | 🧠 | **Local transcription** | Offline, no API keys — NVIDIA Parakeet ONNX (int8, ~478 MB) |
 | 📌 | **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
@@ -42,7 +43,7 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
 | 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
-| ✅ | **Tested** | 35 unit tests covering aggregator, config, session management, and handler utilities |
+| ✅ | **Tested** | 34 unit tests covering aggregator, config, session management, and handler utilities |
 
 ## 🚀 Quick Start
 
@@ -82,11 +83,12 @@ make run-release    # run optimized
  └───────────┘  msg   └──────────┘  stdout└──────────────┘
 ```
 
-1. User sends a message (text or voice)
-2. On first message, toodles warms up gemini-cli with a probe query and shows an animated indicator
-3. The actual query is streamed — each stdout line from gemini-cli is immediately forwarded to Telegram
-4. Streaming uses `sendMessageDraft` (animated typing) with automatic `edit_message_text` fallback
-5. Subsequent messages reuse the warmed session via `--resume latest`
+1. User sends a message (text, photo, document, or voice)
+2. Messages are aggregated within a 1.5s window (handles albums and split messages)
+3. An instant "⏳" placeholder is sent so the user sees immediate feedback
+4. The query is streamed — each stdout line from gemini-cli is forwarded to Telegram via `sendMessageDraft`
+5. Final response is committed with Markdown formatting (with automatic plain-text fallback)
+6. Subsequent messages reuse the session via `--resume latest`
 
 ## 🎙 Voice Transcription
 
@@ -146,10 +148,10 @@ RUST_LOG=info
 
 | Command | Description |
 |---|---|
-| `/start` | Приветствие и знакомство 👋 |
-| `/new` | Начать с чистого листа 🔄 |
-| `/status` | Статус бота 📊 |
-| `/help` | Показать команды 💡 |
+| `/start` | Get started 👋 |
+| `/new` | Start fresh 🔄 |
+| `/status` | Bot status 📊 |
+| `/help` | Show commands 💡 |
 
 ## 📐 Architecture
 
@@ -157,15 +159,16 @@ RUST_LOG=info
 src/
 ├── main.rs             — entry point, dispatcher, bot commands
 ├── config.rs           — Config from env vars
-├── session.rs          — gemini-cli subprocess: warm-up, streaming query
-├── aggregator.rs       — message batching with debounce window
-├── telegram_api.rs     — raw Telegram API (sendMessageDraft)
+├── session.rs          — gemini-cli subprocess management, streaming query
+├── aggregator.rs       — message batching with debounce window + file guard ownership
+├── telegram_api.rs     — raw Telegram API (sendMessageDraft), global HTTP client
 ├── setup.rs            — interactive setup wizard (--setup)
 ├── transcription.rs    — Parakeet V3 engine + model download
 └── handlers/
-    ├── mod.rs           — shared: warm-up indicator, draft streaming, file sending
+    ├── mod.rs           — TempFileGuard, instant placeholder, draft streaming, Markdown fallback
     ├── message.rs       — text message handler (with aggregation)
-    ├── document.rs      — document/file handler (download + query)
+    ├── document.rs      — document/file handler (download + aggregate + query)
+    ├── photo.rs         — photo handler (download + aggregate albums + query)
     └── voice.rs         — voice handler (transcribe → query)
 ```
 
@@ -174,15 +177,15 @@ src/
 ```mermaid
 stateDiagram-v2
     [*] --> New: /new or first message
-    New --> WarmUp: probe query + animated indicator
-    WarmUp --> Ready: ✅ Session ready!
+    New --> Ready: session created
     Ready --> Query: user message
-    Query --> Streaming: line-by-line via BufReader
-    Streaming --> Ready: response complete
+    Query --> Placeholder: ⏳ sent instantly
+    Placeholder --> Streaming: line-by-line via BufReader
+    Streaming --> Ready: response committed (Markdown)
     Ready --> [*]: /new (reset)
 ```
 
-Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` fallback). Sequential messages are aggregated via a 1.5s debounce window before querying.
+Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` commit). Sequential messages and photo albums are aggregated via a 1.5s debounce window. Temporary files (photos, documents) are kept alive via `Arc<TempFileGuard>` in the aggregator until the query completes.
 
 ## 🛠 Makefile
 
