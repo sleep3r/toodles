@@ -25,3 +25,10 @@ tar = "0.4"
 futures-util = "0.3"
 dirs = "6"
 indicatif = "0.17"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "escape_html"
+harness = false
