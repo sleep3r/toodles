@@ -98,7 +98,6 @@ impl Session {
         let mut cmd = Command::new(&self.gemini_cli_path);
         cmd.arg("-p").arg(&full_prompt)
             .arg("-o").arg("text")
-            .arg("--sandbox=false")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
