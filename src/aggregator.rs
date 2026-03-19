@@ -60,7 +60,6 @@ impl MessageAggregator {
         }
     }
 
-
     /// Take the aggregated parts if the deadline has passed.
     /// Returns `None` if there's still time left or no batch exists.
     pub fn take_if_ready(&self, key: &SessionKey) -> Option<Vec<MessagePart>> {
@@ -83,7 +82,13 @@ impl MessageAggregator {
     }
 
     /// Combine message parts into a single prompt string, file paths, and guards.
-    pub fn combine(parts: &[MessagePart]) -> (String, Vec<String>, Vec<Arc<crate::handlers::TempFileGuard>>) {
+    pub fn combine(
+        parts: &[MessagePart],
+    ) -> (
+        String,
+        Vec<String>,
+        Vec<Arc<crate::handlers::TempFileGuard>>,
+    ) {
         let text = if parts.len() == 1 {
             parts[0].text.clone()
         } else {
@@ -94,7 +99,8 @@ impl MessageAggregator {
                 .join("\n\n")
         };
         let files: Vec<String> = parts.iter().flat_map(|p| p.files.clone()).collect();
-        let guards: Vec<Arc<crate::handlers::TempFileGuard>> = parts.iter().flat_map(|p| p._guards.clone()).collect();
+        let guards: Vec<Arc<crate::handlers::TempFileGuard>> =
+            parts.iter().flat_map(|p| p._guards.clone()).collect();
         (text, files, guards)
     }
 
@@ -186,11 +192,7 @@ mod tests {
 
     #[test]
     fn combine_multiple_parts() {
-        let parts = vec![
-            make_part("first"),
-            make_part("second"),
-            make_part("third"),
-        ];
+        let parts = vec![make_part("first"), make_part("second"), make_part("third")];
         let (text, files, guards) = MessageAggregator::combine(&parts);
         assert_eq!(text, "first\n\nsecond\n\nthird");
         assert!(files.is_empty());

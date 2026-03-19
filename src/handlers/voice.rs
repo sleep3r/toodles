@@ -130,12 +130,7 @@ pub async fn handle_voice(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
-            send_reply(
-                &bot,
-                &msg,
-                &format!("❌ Could not start gemini-cli: {e}"),
-            )
-            .await?;
+            send_reply(&bot, &msg, &format!("❌ Could not start gemini-cli: {e}")).await?;
             return Ok(());
         }
     };
@@ -165,13 +160,10 @@ async fn transcribe_locally(
     transcriber: &Arc<Mutex<LocalTranscriber>>,
     ogg_bytes: &[u8],
 ) -> Result<String> {
-    // Decode OGG → f32 16kHz (CPU-bound, run in blocking thread)
-    let bytes = ogg_bytes.to_vec();
-    let samples = tokio::task::spawn_blocking(move || {
-        crate::transcription::decode_ogg_to_f32_16khz(&bytes)
-    })
-    .await
-    .context("Decode task panicked")??;
+    // Decode OGG → f32 16kHz
+    let samples = crate::transcription::decode_ogg_to_f32_16khz(ogg_bytes)
+        .await
+        .context("Decode failed")?;
 
     // Run inference (CPU-bound)
     let transcriber = transcriber.clone();

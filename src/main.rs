@@ -83,12 +83,7 @@ async fn command_handler(
         }
         Cmd::Status => {
             let count = sessions.session_count();
-            send_reply(
-                &bot,
-                &msg,
-                &format!("📊 Active sessions: {count}"),
-            )
-            .await?;
+            send_reply(&bot, &msg, &format!("📊 Active sessions: {count}")).await?;
         }
         Cmd::Help => {
             send_reply(&bot, &msg, &Cmd::descriptions().to_string()).await?;
@@ -145,28 +140,15 @@ async fn main() {
     );
 
     // Load local transcription engine if configured.
-    let local_transcriber: Option<Arc<Mutex<LocalTranscriber>>> =
-        if config.use_local_transcription {
-            // Download model if not present yet.
-            if !transcription::is_model_downloaded(&config.models_dir) {
-                info!("Parakeet model not found — downloading…");
-                if let Err(e) = transcription::download_model(&config.models_dir).await {
-                    error!("Failed to download Parakeet model: {e:#}");
-                    warn!("Local transcription disabled — falling back to Whisper API");
-                    None
-                } else {
-                    match LocalTranscriber::load(&config.models_dir) {
-                        Ok(t) => {
-                            info!("Parakeet model loaded");
-                            Some(Arc::new(Mutex::new(t)))
-                        }
-                        Err(e) => {
-                            error!("Failed to load Parakeet model: {e:#}");
-                            warn!("Local transcription disabled — falling back to Whisper API");
-                            None
-                        }
-                    }
-                }
+    let local_transcriber: Option<Arc<Mutex<LocalTranscriber>>> = if config.use_local_transcription
+    {
+        // Download model if not present yet.
+        if !transcription::is_model_downloaded(&config.models_dir) {
+            info!("Parakeet model not found — downloading…");
+            if let Err(e) = transcription::download_model(&config.models_dir).await {
+                error!("Failed to download Parakeet model: {e:#}");
+                warn!("Local transcription disabled — falling back to Whisper API");
+                None
             } else {
                 match LocalTranscriber::load(&config.models_dir) {
                     Ok(t) => {
@@ -181,8 +163,21 @@ async fn main() {
                 }
             }
         } else {
-            None
-        };
+            match LocalTranscriber::load(&config.models_dir) {
+                Ok(t) => {
+                    info!("Parakeet model loaded");
+                    Some(Arc::new(Mutex::new(t)))
+                }
+                Err(e) => {
+                    error!("Failed to load Parakeet model: {e:#}");
+                    warn!("Local transcription disabled — falling back to Whisper API");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
 
     let bot = Bot::new(&config.telegram_bot_token);
 
@@ -213,7 +208,12 @@ async fn main() {
         .branch(Message::filter_text().endpoint(handle_text));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config, sessions, local_transcriber, aggregator])
+        .dependencies(dptree::deps![
+            config,
+            sessions,
+            local_transcriber,
+            aggregator
+        ])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

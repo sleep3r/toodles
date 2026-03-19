@@ -47,8 +47,11 @@ pub async fn handle_document(
     let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     let temp_dir = home_dir.join(".gemini/tmp/toodles");
     tokio::fs::create_dir_all(&temp_dir).await.ok();
-    
-    let local_path = temp_dir.join(format!("toodles_{unique_id}_{file_name}")).to_string_lossy().to_string();
+
+    let local_path = temp_dir
+        .join(format!("toodles_{unique_id}_{file_name}"))
+        .to_string_lossy()
+        .to_string();
 
     // Download the file from Telegram.
     info!("Downloading document: {file_name} → {local_path}");
@@ -64,17 +67,18 @@ pub async fn handle_document(
     let caption = msg
         .caption()
         .unwrap_or("No caption provided. Describe the file contents and ask what I should do.");
-    let prompt = format!(
-        "User sent a file: {file_name} (saved at {local_path})\n\n{caption}"
-    );
+    let prompt = format!("User sent a file: {file_name} (saved at {local_path})\n\n{caption}");
 
     // Use aggregation.
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart {
-        text: prompt,
-        files: vec![local_path.clone()],
-        _guards: vec![guard],
-    });
+    let is_first = aggregator.push(
+        key,
+        MessagePart {
+            text: prompt,
+            files: vec![local_path.clone()],
+            _guards: vec![guard],
+        },
+    );
 
     if !is_first {
         return Ok(()); // Another handler instance will drain the batch.
@@ -96,12 +100,8 @@ pub async fn handle_document(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
-            super::message::send_reply(
-                &bot,
-                &msg,
-                &format!("❌ Could not start gemini-cli: {e}"),
-            )
-            .await?;
+            super::message::send_reply(&bot, &msg, &format!("❌ Could not start gemini-cli: {e}"))
+                .await?;
             return Ok(());
         }
     };

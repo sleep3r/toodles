@@ -51,8 +51,6 @@ impl Session {
         }
     }
 
-
-
     /// Send a prompt and stream the response line-by-line.
     ///
     /// Uses `gemini -p "prompt" -o text --sandbox=false [--yolo] [--resume latest]`.
@@ -96,8 +94,10 @@ impl Session {
         }
 
         let mut cmd = Command::new(&self.gemini_cli_path);
-        cmd.arg("-p").arg(&full_prompt)
-            .arg("-o").arg("text")
+        cmd.arg("-p")
+            .arg(&full_prompt)
+            .arg("-o")
+            .arg("text")
             .arg("--sandbox=false")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -114,8 +114,13 @@ impl Session {
 
         // Allow gemini-cli to read directories containing attached files.
         if !file_paths.is_empty() {
-            let mut dirs: Vec<String> = file_paths.iter()
-                .filter_map(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().to_string()))
+            let mut dirs: Vec<String> = file_paths
+                .iter()
+                .filter_map(|p| {
+                    std::path::Path::new(p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().to_string())
+                })
                 .collect();
             dirs.sort();
             dirs.dedup();
@@ -126,11 +131,14 @@ impl Session {
             cmd.current_dir(dir);
         }
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("Failed to spawn '{}'", self.gemini_cli_path))?;
 
         // Stream stdout line-by-line as gemini-cli produces output.
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .context("Failed to capture gemini-cli stdout")?;
 
         // Spawn a task to log stderr in the background.
