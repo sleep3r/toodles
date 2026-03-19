@@ -240,9 +240,16 @@ fn markdown_to_telegram_html(md: &str) -> String {
 
 /// Escape HTML special characters.
 fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Apply inline Markdown formatting to already-escaped HTML text.
