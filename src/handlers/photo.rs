@@ -67,11 +67,14 @@ pub async fn handle_photo(
 
     // Use aggregation to batch album photos into a single query.
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart {
-        text: prompt,
-        files: vec![file_path.clone()],
-        _guards: vec![guard],
-    });
+    let is_first = aggregator.push(
+        key,
+        MessagePart {
+            text: prompt,
+            files: vec![file_path.clone()],
+            _guards: vec![guard],
+        },
+    );
 
     if !is_first {
         return Ok(()); // Another handler instance will drain the batch.
@@ -93,12 +96,7 @@ pub async fn handle_photo(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create session: {e}");
-            send_reply(
-                &bot,
-                &msg,
-                &format!("❌ Could not start gemini-cli: {e}"),
-            )
-            .await?;
+            send_reply(&bot, &msg, &format!("❌ Could not start gemini-cli: {e}")).await?;
             return Ok(());
         }
     };

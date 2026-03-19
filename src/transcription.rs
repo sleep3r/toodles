@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use tracing::info;
 use transcribe_rs::engines::parakeet::{
     ParakeetEngine, ParakeetInferenceParams, ParakeetModelParams, TimestampGranularity,
 };
 use transcribe_rs::TranscriptionEngine;
-use tracing::info;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -92,9 +92,7 @@ pub async fn download_model(models_dir: &Path) -> Result<()> {
         let actual = std::fs::metadata(&partial_path)?.len();
         if actual != total_size {
             let _ = std::fs::remove_file(&partial_path);
-            anyhow::bail!(
-                "Download incomplete: expected {total_size} bytes, got {actual} bytes"
-            );
+            anyhow::bail!("Download incomplete: expected {total_size} bytes, got {actual} bytes");
         }
     }
 
@@ -206,8 +204,8 @@ impl LocalTranscriber {
 ///
 /// Uses `ffmpeg` as a subprocess to avoid C library linking issues.
 /// Requires `ffmpeg` to be installed on the system.
-pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
-    use std::process::Command;
+pub async fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
+    use tokio::process::Command;
 
     // Write OGG to a temp file (unique per call).
     let tmp_dir = std::env::temp_dir();
@@ -216,46 +214,60 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let input_path = tmp_dir.join(format!("toodles_{id}_{ts}.ogg"));
-    let output_path = tmp_dir.join(format!("toodles_{id}_{ts}.raw"));
 
-    std::fs::write(&input_path, ogg_bytes)
+    // To ensure unique paths per async task without collisions
+    let task_id = tokio::task::id();
+    let input_path = tmp_dir.join(format!("toodles_{id}_{ts}_{task_id}.ogg"));
+    let output_path = tmp_dir.join(format!("toodles_{id}_{ts}_{task_id}.raw"));
+
+    tokio::fs::write(&input_path, ogg_bytes)
+        .await
         .context("Failed to write temp OGG file")?;
 
     // Convert to raw 16-bit signed LE, 16 kHz, mono via ffmpeg.
     let status = Command::new("ffmpeg")
         .args([
-            "-y",              // overwrite output
-            "-i", &input_path.to_string_lossy(),
-            "-f", "s16le",     // raw PCM signed 16-bit little-endian
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",    // 16 kHz
-            "-ac", "1",        // mono
+            "-y", // overwrite output
+            "-i",
+            &input_path.to_string_lossy(),
+            "-f",
+            "s16le", // raw PCM signed 16-bit little-endian
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000", // 16 kHz
+            "-ac",
+            "1", // mono
             &output_path.to_string_lossy(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
+        .await
         .context("Failed to run ffmpeg. Is it installed? (brew install ffmpeg)")?;
 
     // Clean up input file.
-    let _ = std::fs::remove_file(&input_path);
+    let _ = tokio::fs::remove_file(&input_path).await;
 
     if !status.success() {
-        let _ = std::fs::remove_file(&output_path);
+        let _ = tokio::fs::remove_file(&output_path).await;
         anyhow::bail!("ffmpeg exited with status: {status}");
     }
 
     // Read raw PCM bytes.
-    let raw_bytes = std::fs::read(&output_path)
+    let raw_bytes = tokio::fs::read(&output_path)
+        .await
         .context("Failed to read ffmpeg output")?;
-    let _ = std::fs::remove_file(&output_path);
+    let _ = tokio::fs::remove_file(&output_path).await;
 
     if raw_bytes.len() < 2 {
         anyhow::bail!("No audio samples decoded from OGG");
     }
 
     // Convert i16 LE bytes → f32 normalized to [-1.0, 1.0].
+    // Since this is purely CPU-bound and very short for typical voice messages,
+    // we do it inline. For extremely large files, it might be spawned blocking,
+    // but a Telegram voice note is usually under a few minutes.
     let samples_f32: Vec<f32> = raw_bytes
         .chunks_exact(2)
         .map(|chunk| {
@@ -272,4 +284,3 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
 
     Ok(samples_f32)
 }
-
