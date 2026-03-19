@@ -391,50 +391,104 @@ mod tests {
     #[test]
     fn test_markdown_headers() {
         assert_eq!(markdown_to_telegram_html("# Header 1"), "\n<b>Header 1</b>");
-        assert_eq!(markdown_to_telegram_html("## Header 2"), "\n<b>Header 2</b>");
-        assert_eq!(markdown_to_telegram_html("### Header 3"), "\n<b>Header 3</b>");
+        assert_eq!(
+            markdown_to_telegram_html("## Header 2"),
+            "\n<b>Header 2</b>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("### Header 3"),
+            "\n<b>Header 3</b>"
+        );
         // Escaping HTML in headers
-        assert_eq!(markdown_to_telegram_html("# Header <1>"), "\n<b>Header &lt;1&gt;</b>");
+        assert_eq!(
+            markdown_to_telegram_html("# Header <1>"),
+            "\n<b>Header &lt;1&gt;</b>"
+        );
     }
 
     #[test]
     fn test_markdown_bullet_lists() {
-        assert_eq!(markdown_to_telegram_html("* Item 1\n* Item 2"), "• Item 1\n• Item 2");
-        assert_eq!(markdown_to_telegram_html("- Item 1\n- Item 2"), "• Item 1\n• Item 2");
+        assert_eq!(
+            markdown_to_telegram_html("* Item 1\n* Item 2"),
+            "• Item 1\n• Item 2"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("- Item 1\n- Item 2"),
+            "• Item 1\n• Item 2"
+        );
     }
 
     #[test]
     fn test_markdown_numbered_lists() {
-        assert_eq!(markdown_to_telegram_html("1. Item 1\n2. Item 2"), "1. Item 1\n2. Item 2");
+        assert_eq!(
+            markdown_to_telegram_html("1. Item 1\n2. Item 2"),
+            "1. Item 1\n2. Item 2"
+        );
         // Inline formatting maintained in numbered lists
-        assert_eq!(markdown_to_telegram_html("1. **Bold** item"), "1. <b>Bold</b> item");
+        assert_eq!(
+            markdown_to_telegram_html("1. **Bold** item"),
+            "1. <b>Bold</b> item"
+        );
     }
 
     #[test]
     fn test_markdown_fenced_code_blocks() {
-        assert_eq!(markdown_to_telegram_html("```\nfn main() {}\n```"), "<pre><code>fn main() {}\n</code></pre>");
-        assert_eq!(markdown_to_telegram_html("```rust\nfn main() {}\n```"), "<pre><code class=\"language-rust\">fn main() {}\n</code></pre>");
+        assert_eq!(
+            markdown_to_telegram_html("```\nfn main() {}\n```"),
+            "<pre><code>fn main() {}\n</code></pre>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("```rust\nfn main() {}\n```"),
+            "<pre><code class=\"language-rust\">fn main() {}\n</code></pre>"
+        );
         // Escaping in code blocks but no inline formatting
-        assert_eq!(markdown_to_telegram_html("```\n**bold** <tag>\n```"), "<pre><code>**bold** &lt;tag&gt;\n</code></pre>");
+        assert_eq!(
+            markdown_to_telegram_html("```\n**bold** <tag>\n```"),
+            "<pre><code>**bold** &lt;tag&gt;\n</code></pre>"
+        );
 
         // Unclosed code block
-        assert_eq!(markdown_to_telegram_html("```\nfn main() {}"), "<pre><code>fn main() {}\n</code></pre>");
+        assert_eq!(
+            markdown_to_telegram_html("```\nfn main() {}"),
+            "<pre><code>fn main() {}\n</code></pre>"
+        );
     }
 
     #[test]
     fn test_markdown_html_escaping() {
-        assert_eq!(markdown_to_telegram_html("<hello> & \"world\""), "&lt;hello&gt; &amp; \"world\"");
-        assert_eq!(markdown_to_telegram_html("Me & You > Them"), "Me &amp; You &gt; Them");
+        assert_eq!(
+            markdown_to_telegram_html("<hello> & \"world\""),
+            "&lt;hello&gt; &amp; \"world\""
+        );
+        assert_eq!(
+            markdown_to_telegram_html("Me & You > Them"),
+            "Me &amp; You &gt; Them"
+        );
     }
 
     #[test]
     fn test_markdown_inline_formatting() {
-        assert_eq!(markdown_to_telegram_html("This is **bold**"), "This is <b>bold</b>");
-        assert_eq!(markdown_to_telegram_html("This is *italic*"), "This is <i>italic</i>");
-        assert_eq!(markdown_to_telegram_html("This is `code`"), "This is <code>code</code>");
-        assert_eq!(markdown_to_telegram_html("This is a [link](https://example.com)"), "This is a <a href=\"https://example.com\">link</a>");
+        assert_eq!(
+            markdown_to_telegram_html("This is **bold**"),
+            "This is <b>bold</b>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("This is *italic*"),
+            "This is <i>italic</i>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("This is `code`"),
+            "This is <code>code</code>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("This is a [link](https://example.com)"),
+            "This is a <a href=\"https://example.com\">link</a>"
+        );
 
         // Mixed
-        assert_eq!(markdown_to_telegram_html("This is **bold** and *italic*"), "This is <b>bold</b> and <i>italic</i>");
+        assert_eq!(
+            markdown_to_telegram_html("This is **bold** and *italic*"),
+            "This is <b>bold</b> and <i>italic</i>"
+        );
     }
 }

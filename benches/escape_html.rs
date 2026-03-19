@@ -24,7 +24,8 @@ fn escape_html_optimized(text: &str) -> String {
 fn bench_escape_html(c: &mut Criterion) {
     let mut group = c.benchmark_group("Escape HTML");
 
-    let text_no_escapes = "This is a normal string without any special characters that need to be escaped.";
+    let text_no_escapes =
+        "This is a normal string without any special characters that need to be escaped.";
     let text_some_escapes = "This string has <some> tags and an & character.";
     let text_many_escapes = "<<<&>>>".repeat(10);
 
