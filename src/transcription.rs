@@ -210,14 +210,9 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
     use std::process::Command;
 
     // Write OGG to a temp file (unique per call).
-    let tmp_dir = std::env::temp_dir();
-    let id = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let input_path = tmp_dir.join(format!("toodles_{id}_{ts}.ogg"));
-    let output_path = tmp_dir.join(format!("toodles_{id}_{ts}.raw"));
+    let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let input_path = tmp_dir.path().join("input.ogg");
+    let output_path = tmp_dir.path().join("output.raw");
 
     std::fs::write(&input_path, ogg_bytes)
         .context("Failed to write temp OGG file")?;
@@ -238,18 +233,13 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
         .status()
         .context("Failed to run ffmpeg. Is it installed? (brew install ffmpeg)")?;
 
-    // Clean up input file.
-    let _ = std::fs::remove_file(&input_path);
-
     if !status.success() {
-        let _ = std::fs::remove_file(&output_path);
         anyhow::bail!("ffmpeg exited with status: {status}");
     }
 
     // Read raw PCM bytes.
     let raw_bytes = std::fs::read(&output_path)
         .context("Failed to read ffmpeg output")?;
-    let _ = std::fs::remove_file(&output_path);
 
     if raw_bytes.len() < 2 {
         anyhow::bail!("No audio samples decoded from OGG");
