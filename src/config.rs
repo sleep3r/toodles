@@ -37,8 +37,8 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self> {
-        let telegram_bot_token = env::var("TELEGRAM_BOT_TOKEN")
-            .context("TELEGRAM_BOT_TOKEN must be set")?;
+        let telegram_bot_token =
+            env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN must be set")?;
 
         let allowed_user_ids = env::var("ALLOWED_USER_IDS")
             .unwrap_or_default()
@@ -47,8 +47,7 @@ impl Config {
             .filter_map(|s| s.trim().parse::<u64>().ok())
             .collect();
 
-        let gemini_cli_path =
-            env::var("GEMINI_CLI_PATH").unwrap_or_else(|_| "gemini".to_string());
+        let gemini_cli_path = env::var("GEMINI_CLI_PATH").unwrap_or_else(|_| "gemini".to_string());
 
         let gemini_working_dir = env::var("GEMINI_WORKING_DIR").ok();
         let openai_api_key = env::var("OPENAI_API_KEY").ok();

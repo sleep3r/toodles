@@ -25,7 +25,6 @@ use tracing::error;
 use crate::config::Config;
 use crate::session::SessionKey;
 
-
 /// Build the session key from a Telegram message.
 ///
 /// Uses `(chat_id, thread_id)` so that each forum topic gets its own
@@ -34,8 +33,6 @@ pub fn session_key(msg: &Message) -> SessionKey {
     // ThreadId(MessageId(i32)) — extract the inner i32
     (msg.chat.id.0, msg.thread_id.map(|t| t.0 .0))
 }
-
-
 
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
@@ -54,7 +51,9 @@ pub async fn stream_response_with_drafts(
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
     // Show typing indicator immediately.
-    bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
+    bot.send_chat_action(msg.chat.id, ChatAction::Typing)
+        .await
+        .ok();
 
     // Send instant placeholder so the user sees activity right away.
     let mut placeholder_id: Option<teloxide::types::MessageId> = None;
@@ -99,14 +98,16 @@ pub async fn stream_response_with_drafts(
 
         // Refresh typing indicator periodically.
         if last_typing.elapsed() >= TYPING_INTERVAL {
-            bot.send_chat_action(msg.chat.id, ChatAction::Typing).await.ok();
+            bot.send_chat_action(msg.chat.id, ChatAction::Typing)
+                .await
+                .ok();
             last_typing = Instant::now();
         }
 
         // Stream updates by editing the placeholder message.
         if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
             if let Some(pid) = placeholder_id {
-                bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
+                bot.edit_message_text(msg.chat.id, pid, truncate_text(&accumulated))
                     .await
                     .ok();
             }
@@ -123,7 +124,8 @@ pub async fn stream_response_with_drafts(
     };
 
     if let Some(pid) = placeholder_id {
-        let edit_res = bot.edit_message_text(msg.chat.id, pid, &final_text)
+        let edit_res = bot
+            .edit_message_text(msg.chat.id, pid, &final_text)
             .parse_mode(ParseMode::Html)
             .await;
         if let Err(e) = edit_res {
@@ -134,10 +136,11 @@ pub async fn stream_response_with_drafts(
         }
     } else {
         // No placeholder was ever sent.
-        let send_res = bot.send_message(msg.chat.id, &final_text)
+        let send_res = bot
+            .send_message(msg.chat.id, &final_text)
             .parse_mode(ParseMode::Html)
             .await;
-        if let Err(_) = send_res {
+        if send_res.is_err() {
             let plain = truncate_text(&accumulated);
             let mut req = bot.send_message(msg.chat.id, &plain);
             if let Some(tid) = msg.thread_id {
@@ -200,9 +203,7 @@ fn markdown_to_telegram_html(md: &str) -> String {
             format!("• {}", format_inline(&escape_html(rest)))
         }
         // Numbered lists — pass through with inline formatting
-        else if line.chars().next().map_or(false, |c| c.is_ascii_digit())
-            && line.contains(". ")
-        {
+        else if line.chars().next().is_some_and(|c| c.is_ascii_digit()) && line.contains(". ") {
             format_inline(&escape_html(line))
         }
         // Horizontal rules
@@ -211,7 +212,10 @@ fn markdown_to_telegram_html(md: &str) -> String {
         }
         // Blockquotes
         else if let Some(rest) = line.strip_prefix("> ") {
-            format!("<blockquote>{}</blockquote>", format_inline(&escape_html(rest)))
+            format!(
+                "<blockquote>{}</blockquote>",
+                format_inline(&escape_html(rest))
+            )
         }
         // Regular text
         else {
@@ -300,21 +304,11 @@ fn format_inline(text: &str) -> String {
 }
 
 fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len()).find(|&i| chars[i] == marker)
 }
 
 fn find_double_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    for i in start..chars.len().saturating_sub(1) {
-        if chars[i] == marker && chars[i + 1] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len().saturating_sub(1)).find(|&i| chars[i] == marker && chars[i + 1] == marker)
 }
 
 fn find_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {

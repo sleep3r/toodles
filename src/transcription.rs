@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use tracing::info;
 use transcribe_rs::engines::parakeet::{
     ParakeetEngine, ParakeetInferenceParams, ParakeetModelParams, TimestampGranularity,
 };
 use transcribe_rs::TranscriptionEngine;
-use tracing::info;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -92,9 +92,7 @@ pub async fn download_model(models_dir: &Path) -> Result<()> {
         let actual = std::fs::metadata(&partial_path)?.len();
         if actual != total_size {
             let _ = std::fs::remove_file(&partial_path);
-            anyhow::bail!(
-                "Download incomplete: expected {total_size} bytes, got {actual} bytes"
-            );
+            anyhow::bail!("Download incomplete: expected {total_size} bytes, got {actual} bytes");
         }
     }
 
@@ -183,7 +181,6 @@ impl LocalTranscriber {
                 audio,
                 Some(ParakeetInferenceParams {
                     timestamp_granularity: TimestampGranularity::Segment,
-                    ..Default::default()
                 }),
             )
             .map_err(|e| anyhow::anyhow!("Parakeet transcription failed: {e}"))?;
@@ -219,18 +216,22 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
     let input_path = tmp_dir.join(format!("toodles_{id}_{ts}.ogg"));
     let output_path = tmp_dir.join(format!("toodles_{id}_{ts}.raw"));
 
-    std::fs::write(&input_path, ogg_bytes)
-        .context("Failed to write temp OGG file")?;
+    std::fs::write(&input_path, ogg_bytes).context("Failed to write temp OGG file")?;
 
     // Convert to raw 16-bit signed LE, 16 kHz, mono via ffmpeg.
     let status = Command::new("ffmpeg")
         .args([
-            "-y",              // overwrite output
-            "-i", &input_path.to_string_lossy(),
-            "-f", "s16le",     // raw PCM signed 16-bit little-endian
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",    // 16 kHz
-            "-ac", "1",        // mono
+            "-y", // overwrite output
+            "-i",
+            &input_path.to_string_lossy(),
+            "-f",
+            "s16le", // raw PCM signed 16-bit little-endian
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000", // 16 kHz
+            "-ac",
+            "1", // mono
             &output_path.to_string_lossy(),
         ])
         .stdout(std::process::Stdio::null())
@@ -247,8 +248,7 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
     }
 
     // Read raw PCM bytes.
-    let raw_bytes = std::fs::read(&output_path)
-        .context("Failed to read ffmpeg output")?;
+    let raw_bytes = std::fs::read(&output_path).context("Failed to read ffmpeg output")?;
     let _ = std::fs::remove_file(&output_path);
 
     if raw_bytes.len() < 2 {
@@ -272,4 +272,3 @@ pub fn decode_ogg_to_f32_16khz(ogg_bytes: &[u8]) -> Result<Vec<f32>> {
 
     Ok(samples_f32)
 }
-

@@ -37,7 +37,14 @@ pub async fn handle_text(
     };
 
     let key = session_key(&msg);
-    let is_first = aggregator.push(key, MessagePart { text, files: vec![], _guards: vec![] });
+    let is_first = aggregator.push(
+        key,
+        MessagePart {
+            text,
+            files: vec![],
+            _guards: vec![],
+        },
+    );
 
     if !is_first {
         // Another handler instance is already waiting; our part was appended.
@@ -50,7 +57,7 @@ pub async fn handle_text(
         }
         match aggregator.wait_deadline(&key) {
             Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
-            Some(_) => continue, // deadline just passed, try take again
+            Some(_) => continue,   // deadline just passed, try take again
             None => return Ok(()), // batch was taken by another task
         }
     };
