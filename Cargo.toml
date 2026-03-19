@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Telegram bot wrapper for gemini-cli"
 license = "MIT"
+default-run = "toodles"
 
 [dependencies]
 teloxide = { version = "0.13", features = ["macros", "throttle"] }
