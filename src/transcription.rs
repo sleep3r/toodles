@@ -9,6 +9,9 @@ use transcribe_rs::engines::parakeet::{
 use transcribe_rs::TranscriptionEngine;
 use tracing::info;
 
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
 // ──────────────────────────────────────────────────────────────────────────────
@@ -49,8 +52,7 @@ pub async fn download_model(models_dir: &Path) -> Result<()> {
     }
 
     // Download
-    let client = reqwest::Client::new();
-    let response = client
+    let response = HTTP_CLIENT
         .get(MODEL_URL)
         .send()
         .await

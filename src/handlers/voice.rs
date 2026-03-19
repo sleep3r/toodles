@@ -15,6 +15,9 @@ use crate::transcription::LocalTranscriber;
 use super::message::send_reply;
 use super::session_key;
 
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 /// Handle a voice message: download the OGG file, transcribe it either
 /// locally (Parakeet) or via OpenAI Whisper, and forward the transcription
 /// to the gemini-cli session.
@@ -198,8 +201,7 @@ async fn transcribe_with_whisper(api_key: &str, audio_bytes: Vec<u8>) -> Result<
         .text("model", "whisper-1")
         .part("file", part);
 
-    let client = reqwest::Client::new();
-    let response = client
+    let response = HTTP_CLIENT
         .post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {api_key}"))
         .multipart(form)
