@@ -15,6 +15,7 @@ impl Drop for TempFileGuard {
 }
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,8 +23,9 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InputFile, Message, ParseMode};
 use tracing::error;
 
+use crate::aggregator::MessageAggregator;
 use crate::config::Config;
-use crate::session::SessionKey;
+use crate::session::{SessionKey, SessionManager};
 
 /// Build the session key from a Telegram message.
 ///
@@ -32,6 +34,82 @@ use crate::session::SessionKey;
 pub fn session_key(msg: &Message) -> SessionKey {
     // ThreadId(MessageId(i32)) — extract the inner i32
     (msg.chat.id.0, msg.thread_id.map(|t| t.0 .0))
+}
+
+/// Spawn a background task that waits for the aggregation deadline,
+/// combines all buffered parts, and processes the query through gemini-cli.
+///
+/// By running this in a separate task (instead of blocking the handler),
+/// we allow the teloxide dispatcher to process subsequent updates from the
+/// same chat immediately — which is critical for the aggregator to actually
+/// collect multiple parts from split messages.
+pub fn spawn_drain_task(
+    bot: Bot,
+    msg: Message,
+    config: Arc<Config>,
+    sessions: Arc<SessionManager>,
+    aggregator: Arc<MessageAggregator>,
+    key: SessionKey,
+) {
+    tokio::spawn(async move {
+        // Wait for the aggregation deadline.
+        let combined = loop {
+            if let Some(parts) = aggregator.take_if_ready(&key) {
+                break MessageAggregator::combine(&parts);
+            }
+            match aggregator.wait_deadline(&key) {
+                Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
+                Some(_) => continue,
+                None => return,
+            }
+        };
+        let (combined_text, combined_files, _guards) = combined;
+
+        // Get or create the gemini-cli session.
+        let (session, _is_new) = match sessions.get_or_create(key).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to create session: {e}");
+                let err_msg = format!(
+                    "❌ Could not start gemini-cli.\n\
+                     Make sure `{}` is installed and on your PATH.\n\
+                     Error: {e}",
+                    config.gemini_cli_path
+                );
+                let mut req = bot.send_message(msg.chat.id, err_msg);
+                if let Some(tid) = msg.thread_id {
+                    req = req.message_thread_id(tid);
+                }
+                req.await.ok();
+                return;
+            }
+        };
+
+        // Query gemini-cli.
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let session_clone = session.clone();
+        tokio::spawn(async move {
+            let _g = _guards;
+            let mut sess = session_clone.lock().await;
+            if combined_files.is_empty() {
+                if let Err(e) = sess.query(&combined_text, tx).await {
+                    error!("Session query error: {e}");
+                }
+            } else {
+                if let Err(e) = sess
+                    .query_with_files(&combined_text, &combined_files, tx)
+                    .await
+                {
+                    error!("Session query error: {e}");
+                }
+            }
+        });
+
+        // Stream the response to the user.
+        if let Err(e) = stream_response_with_drafts(&bot, &msg, &config, rx).await {
+            error!("Stream response error: {e}");
+        }
+    });
 }
 
 /// Stream the gemini-cli response to the user, handling file attachments.

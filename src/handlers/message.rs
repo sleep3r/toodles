@@ -3,8 +3,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::Message;
-use tokio::sync::mpsc;
-use tracing::error;
 
 use crate::aggregator::{MessageAggregator, MessagePart};
 use crate::config::Config;
@@ -46,60 +44,9 @@ pub async fn handle_text(
         },
     );
 
-    if !is_first {
-        // Another handler instance is already waiting; our part was appended.
-        return Ok(());
+    if is_first {
+        super::spawn_drain_task(bot, msg, config, sessions, aggregator, key);
     }
-
-    let combined = loop {
-        if let Some(parts) = aggregator.take_if_ready(&key) {
-            break MessageAggregator::combine(&parts);
-        }
-        match aggregator.wait_deadline(&key) {
-            Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
-            Some(_) => continue,   // deadline just passed, try take again
-            None => return Ok(()), // batch was taken by another task
-        }
-    };
-    let (combined, combined_files, _guards) = combined;
-
-    let (session, _is_new) = match sessions.get_or_create(key).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create session: {e}");
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "❌ Could not start gemini-cli.\n\
-                     Make sure `{}` is installed and on your PATH.\n\
-                     Error: {e}",
-                    config.gemini_cli_path
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let (tx, rx) = mpsc::channel::<String>(64);
-
-    let session_clone = session.clone();
-    tokio::spawn(async move {
-        let _g = _guards; // Keep temp file guards alive.
-        let mut sess = session_clone.lock().await;
-        if combined_files.is_empty() {
-            if let Err(e) = sess.query(&combined, tx).await {
-                error!("Session query error: {e}");
-            }
-        } else {
-            if let Err(e) = sess.query_with_files(&combined, &combined_files, tx).await {
-                error!("Session query error: {e}");
-            }
-        }
-    });
-
-    // Stream the response.
-    super::stream_response_with_drafts(&bot, &msg, &config, rx).await?;
 
     Ok(())
 }

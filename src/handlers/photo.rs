@@ -4,8 +4,7 @@ use anyhow::Result;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::Message;
-use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::aggregator::{MessageAggregator, MessagePart};
 use crate::config::Config;
@@ -76,43 +75,9 @@ pub async fn handle_photo(
         },
     );
 
-    if !is_first {
-        return Ok(()); // Another handler instance will drain the batch.
+    if is_first {
+        super::spawn_drain_task(bot, msg, config, sessions, aggregator, key);
     }
-
-    let combined = loop {
-        if let Some(parts) = aggregator.take_if_ready(&key) {
-            break MessageAggregator::combine(&parts);
-        }
-        match aggregator.wait_deadline(&key) {
-            Some(d) if !d.is_zero() => tokio::time::sleep(d).await,
-            Some(_) => continue,
-            None => return Ok(()),
-        }
-    };
-    let (combined, combined_files, _guards) = combined;
-
-    let (session, _is_new) = match sessions.get_or_create(key).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create session: {e}");
-            send_reply(&bot, &msg, &format!("❌ Could not start gemini-cli: {e}")).await?;
-            return Ok(());
-        }
-    };
-
-    let (tx, rx) = mpsc::channel::<String>(64);
-    let session_clone = session.clone();
-    tokio::spawn(async move {
-        let _g = _guards; // Keep all temp file guards alive.
-        let mut sess = session_clone.lock().await;
-        if let Err(e) = sess.query_with_files(&combined, &combined_files, tx).await {
-            error!("Session query error: {e}");
-        }
-    });
-
-    // Stream the response.
-    super::stream_response_with_drafts(&bot, &msg, &config, rx).await?;
 
     Ok(())
 }
