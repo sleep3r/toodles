@@ -19,10 +19,12 @@ use aggregator::MessageAggregator;
 use config::Config;
 use handlers::{
     document::handle_document,
+    handle_stop_callback,
     message::{handle_text, send_reply},
     photo::handle_photo,
     session_key,
     voice::handle_voice,
+    CancelRegistry,
 };
 use session::SessionManager;
 use transcription::LocalTranscriber;
@@ -190,8 +192,9 @@ async fn main() {
 
     let sessions = Arc::new(SessionManager::new(config.clone()));
     let aggregator = Arc::new(MessageAggregator::new(Duration::from_millis(1500)));
+    let cancel_registry: CancelRegistry = Arc::new(dashmap::DashMap::new());
 
-    let handler = Update::filter_message()
+    let message_handler = Update::filter_message()
         // 1. Commands (must be checked before the plain-text handler).
         .branch(
             Message::filter_text()
@@ -207,12 +210,19 @@ async fn main() {
         // 5. Plain text messages forwarded to gemini-cli.
         .branch(Message::filter_text().endpoint(handle_text));
 
+    let callback_handler = Update::filter_callback_query().endpoint(handle_stop_callback);
+
+    let handler = dptree::entry()
+        .branch(message_handler)
+        .branch(callback_handler);
+
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![
             config,
             sessions,
             local_transcriber,
-            aggregator
+            aggregator,
+            cancel_registry
         ])
         .enable_ctrlc_handler()
         .build()

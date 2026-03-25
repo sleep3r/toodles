@@ -13,7 +13,7 @@ use crate::session::SessionManager;
 use crate::transcription::LocalTranscriber;
 
 use super::message::send_reply;
-use super::session_key;
+use super::{session_key, CancelRegistry};
 
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
@@ -27,6 +27,7 @@ pub async fn handle_voice(
     config: Arc<Config>,
     sessions: Arc<SessionManager>,
     local_transcriber: Option<Arc<Mutex<LocalTranscriber>>>,
+    cancel_registry: CancelRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0,
@@ -135,18 +136,21 @@ pub async fn handle_voice(
         }
     };
 
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let session_clone = session.clone();
     let transcript_clone = transcript.clone();
+    let cancel_clone = cancel.clone();
     tokio::spawn(async move {
         let mut sess = session_clone.lock().await;
-        if let Err(e) = sess.query(&transcript_clone, tx).await {
+        if let Err(e) = sess.query(&transcript_clone, tx, cancel_clone).await {
             error!("Session query error: {e}");
         }
     });
 
     // Stream the response via sendMessageDraft.
-    super::stream_response_with_drafts(&bot, &msg, &config, rx).await?;
+    super::stream_response_with_drafts(&bot, &msg, &config, rx, cancel, cancel_registry).await?;
 
     Ok(())
 }

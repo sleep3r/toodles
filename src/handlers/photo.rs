@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::session::SessionManager;
 
 use super::message::send_reply;
-use super::session_key;
+use super::{session_key, CancelRegistry};
 
 /// Handle a photo message: download the image, aggregate with album siblings,
 /// and pass to gemini-cli for analysis.
@@ -21,6 +21,7 @@ pub async fn handle_photo(
     config: Arc<Config>,
     sessions: Arc<SessionManager>,
     aggregator: Arc<MessageAggregator>,
+    cancel_registry: CancelRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0,
@@ -76,7 +77,7 @@ pub async fn handle_photo(
     );
 
     if is_first {
-        super::spawn_drain_task(bot, msg, config, sessions, aggregator, key);
+        super::spawn_drain_task(bot, msg, config, sessions, aggregator, key, cancel_registry);
     }
 
     Ok(())

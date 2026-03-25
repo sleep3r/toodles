@@ -38,3 +38,4 @@ _agent/
 _agents/
 .claude/
 GEMINI.md
+.DS_Store

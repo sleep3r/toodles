@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::config::Config;
@@ -58,19 +59,24 @@ impl Session {
         &mut self,
         prompt: &str,
         tx: tokio::sync::mpsc::Sender<String>,
+        cancel: CancellationToken,
     ) -> Result<()> {
-        self.query_with_files(prompt, &[], tx).await
+        self.query_with_files(prompt, &[], tx, cancel).await
     }
 
     /// Send a prompt with optional file attachments and stream the response line-by-line.
     ///
     /// Files are passed as positional arguments to gemini-cli so it uploads them
     /// via the Gemini API as multimodal parts.
+    ///
+    /// If the `cancel` token is triggered, the gemini-cli process is killed and
+    /// the method returns early.
     pub async fn query_with_files(
         &mut self,
         prompt: &str,
         file_paths: &[String],
         tx: tokio::sync::mpsc::Sender<String>,
+        cancel: CancellationToken,
     ) -> Result<()> {
         debug!("Query: {}", &prompt[..prompt.len().min(80)]);
 
@@ -165,36 +171,58 @@ impl Session {
 
         let mut reader = tokio::io::BufReader::new(stdout);
         let mut line_buf = String::new();
+        let mut cancelled = false;
 
         loop {
             line_buf.clear();
-            match reader.read_line(&mut line_buf).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
-                    // Send all lines (including empty ones for paragraph breaks).
-                    let _ = tx.send(stripped).await;
+            tokio::select! {
+                result = reader.read_line(&mut line_buf) => {
+                    match result {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
+                            let _ = tx.send(stripped).await;
+                        }
+                        Err(e) => {
+                            error!("Error reading gemini-cli stdout: {e}");
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Error reading gemini-cli stdout: {e}");
+                _ = cancel.cancelled() => {
+                    info!("Generation cancelled by user — killing gemini-cli");
+                    let _ = child.kill().await;
+                    cancelled = true;
                     break;
                 }
             }
         }
 
-        // Wait for the process to exit with a timeout to prevent deadlocks.
-        match tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await {
-            Ok(Ok(status)) if !status.success() => {
-                error!("gemini-cli exited with {}", status);
+        if !cancelled {
+            // Wait for the process to exit with a generous timeout to allow
+            // for tool-use operations (e.g. creating Google Docs via gws).
+            match tokio::time::timeout(std::time::Duration::from_secs(300), child.wait()).await {
+                Ok(Ok(status)) if !status.success() => {
+                    error!("gemini-cli exited with {}", status);
+                    let _ = tx
+                        .send(format!("\n⚠️ gemini-cli завершился с ошибкой ({})", status))
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to wait for gemini-cli: {e}");
+                    let _ = tx
+                        .send(format!("\n⚠️ Ошибка gemini-cli: {e}"))
+                        .await;
+                }
+                Err(_) => {
+                    error!("gemini-cli timed out after 300s! Killing process.");
+                    let _ = child.kill().await;
+                    let _ = tx
+                        .send("\n⚠️ gemini-cli не ответил (таймаут 5 минут). Попробуйте снова.".to_string())
+                        .await;
+                }
+                _ => {}
             }
-            Ok(Err(e)) => {
-                error!("Failed to wait for gemini-cli: {e}");
-            }
-            Err(_) => {
-                error!("gemini-cli timed out after 120s! Killing process.");
-                let _ = child.kill().await;
-            }
-            _ => {}
         }
 
         // Let stderr drain.
@@ -411,5 +439,75 @@ mod tests {
 
         mgr.get_or_create((1, None)).await.unwrap(); // existing
         assert_eq!(mgr.session_count(), 2);
+    }
+
+    // ── Session query with CancellationToken ────────────────────────────
+
+    #[tokio::test]
+    async fn session_query_with_echo_produces_output() {
+        // Use `echo` as a dummy gemini-cli — it echoes the prompt to stdout.
+        let mut session = Session::new("echo", None, false, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let cancel = CancellationToken::new();
+
+        session.query("hello world", tx, cancel).await.unwrap();
+
+        // echo writes "[System instruction]: ..." or just the prompt.
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(!lines.is_empty(), "echo should produce at least one line");
+    }
+
+    #[tokio::test]
+    async fn session_query_cancelled_before_start() {
+        let mut session = Session::new("sleep", None, false, None);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let cancel = CancellationToken::new();
+
+        // Cancel immediately before even running.
+        cancel.cancel();
+
+        // sleep 10 would normally block, but the cancel token should kill it.
+        // We use a timeout to ensure the test doesn't hang.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.query("10", tx, cancel),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Query should complete quickly when cancelled");
+    }
+
+    #[tokio::test]
+    async fn session_has_history_after_query() {
+        let mut session = Session::new("echo", None, false, None);
+        assert!(!session.has_history);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
+        let cancel = CancellationToken::new();
+        session.query("test", tx, cancel).await.unwrap();
+
+        assert!(session.has_history);
+    }
+
+    #[tokio::test]
+    async fn session_system_prompt_prepended_on_first_query() {
+        let mut session = Session::new("echo", None, false, Some("Be helpful".to_string()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let cancel = CancellationToken::new();
+
+        session.query("hello", tx, cancel).await.unwrap();
+
+        let mut full_output = String::new();
+        while let Ok(line) = rx.try_recv() {
+            full_output.push_str(&line);
+        }
+        // echo prints the full prompt including system instruction.
+        assert!(
+            full_output.contains("Be helpful"),
+            "System prompt should be in the first query"
+        );
     }
 }

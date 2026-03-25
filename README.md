@@ -32,6 +32,9 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 |---|---|---|
 | 💬 | **Real-time streaming** | Responses streamed line-by-line via `sendMessageDraft` with Markdown formatting and plain-text fallback |
 | ⏳ | **Instant feedback** | "⏳" placeholder sent immediately — no dead silence while gemini-cli starts |
+| 🛑 | **Stop generation** | Inline "🛑 Остановить" button to cancel generation mid-stream — kills gemini-cli instantly |
+| 📝 | **Smart message splitting** | Long responses auto-split into multiple Telegram messages at newline boundaries — no truncation |
+| ⚠️ | **Error feedback** | Errors and timeouts (5 min) are reported to the user instead of silent failure |
 | 📷 | **Photo analysis** | Send photos (including albums) — batched via aggregator and analyzed by Gemini Vision |
 | 📄 | **Document handling** | Send files (PDF, XLSX, etc.) — downloaded and forwarded to gemini-cli for processing |
 | 📎 | **File sharing** | Gemini can send files back via the `ATTACH_FILE:` protocol |
@@ -43,7 +46,7 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
 | 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
-| ✅ | **Tested** | 34 unit tests covering aggregator, config, session management, and handler utilities |
+| ✅ | **Tested** | 68 unit tests covering aggregator, config, session management, cancellation, message splitting, and handler utilities |
 
 ## 🚀 Quick Start
 
@@ -85,10 +88,11 @@ make run-release    # run optimized
 
 1. User sends a message (text, photo, document, or voice)
 2. Messages are aggregated within a 1.5s window (handles albums and split messages)
-3. An instant "⏳" placeholder is sent so the user sees immediate feedback
+3. An instant "⏳" placeholder is sent with a 🛑 **Stop** inline button
 4. The query is streamed — each stdout line from gemini-cli is forwarded to Telegram via `sendMessageDraft`
-5. Final response is committed with Markdown formatting (with automatic plain-text fallback)
-6. Subsequent messages reuse the session via `--resume latest`
+5. User can press **Stop** at any time — gemini-cli is killed instantly via `CancellationToken`
+6. Final response is committed with Markdown formatting, split into multiple messages if needed (with automatic plain-text fallback)
+7. Subsequent messages reuse the session via `--resume latest`
 
 ## 🎙 Voice Transcription
 
@@ -165,7 +169,7 @@ src/
 ├── setup.rs            — interactive setup wizard (--setup)
 ├── transcription.rs    — Parakeet V3 engine + model download
 └── handlers/
-    ├── mod.rs           — TempFileGuard, instant placeholder, draft streaming, Markdown fallback
+    ├── mod.rs           — CancelRegistry, inline stop button, draft streaming, message splitting, Markdown→HTML
     ├── message.rs       — text message handler (with aggregation)
     ├── document.rs      — document/file handler (download + aggregate + query)
     ├── photo.rs         — photo handler (download + aggregate albums + query)
@@ -179,13 +183,15 @@ stateDiagram-v2
     [*] --> New: /new or first message
     New --> Ready: session created
     Ready --> Query: user message
-    Query --> Placeholder: ⏳ sent instantly
+    Query --> Placeholder: ⏳ + 🛑 Stop button
     Placeholder --> Streaming: line-by-line via BufReader
+    Streaming --> Cancelled: user clicks 🛑
+    Cancelled --> Ready: ⬛ Генерация остановлена
     Streaming --> Ready: response committed (Markdown)
     Ready --> [*]: /new (reset)
 ```
 
-Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` commit). Sequential messages and photo albums are aggregated via a 1.5s debounce window. Temporary files (photos, documents) are kept alive via `Arc<TempFileGuard>` in the aggregator until the query completes.
+Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` commit). Users can cancel generation mid-stream via an inline keyboard button, which triggers a `CancellationToken` to kill the gemini-cli process. Long responses are automatically split across multiple Telegram messages at newline boundaries. Sequential messages and photo albums are aggregated via a 1.5s debounce window. Temporary files (photos, documents) are kept alive via `Arc<TempFileGuard>` in the aggregator until the query completes.
 
 ## 🛠 Makefile
 

@@ -19,13 +19,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use dashmap::DashMap;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, Message, ParseMode};
+use teloxide::types::{
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ParseMode,
+};
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::aggregator::MessageAggregator;
 use crate::config::Config;
 use crate::session::{SessionKey, SessionManager};
+
+/// Registry of active cancellation tokens, keyed by callback data string.
+/// Shared between the streaming task and the callback query handler.
+pub type CancelRegistry = Arc<DashMap<String, CancellationToken>>;
 
 /// Build the session key from a Telegram message.
 ///
@@ -50,6 +58,7 @@ pub fn spawn_drain_task(
     sessions: Arc<SessionManager>,
     aggregator: Arc<MessageAggregator>,
     key: SessionKey,
+    cancel_registry: CancelRegistry,
 ) {
     tokio::spawn(async move {
         // Wait for the aggregation deadline.
@@ -85,19 +94,23 @@ pub fn spawn_drain_task(
             }
         };
 
+        // Create a cancellation token for this query.
+        let cancel = CancellationToken::new();
+
         // Query gemini-cli.
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         let session_clone = session.clone();
+        let cancel_clone = cancel.clone();
         tokio::spawn(async move {
             let _g = _guards;
             let mut sess = session_clone.lock().await;
             if combined_files.is_empty() {
-                if let Err(e) = sess.query(&combined_text, tx).await {
+                if let Err(e) = sess.query(&combined_text, tx, cancel_clone).await {
                     error!("Session query error: {e}");
                 }
             } else {
                 if let Err(e) = sess
-                    .query_with_files(&combined_text, &combined_files, tx)
+                    .query_with_files(&combined_text, &combined_files, tx, cancel_clone)
                     .await
                 {
                     error!("Session query error: {e}");
@@ -106,7 +119,9 @@ pub fn spawn_drain_task(
         });
 
         // Stream the response to the user.
-        if let Err(e) = stream_response_with_drafts(&bot, &msg, &config, rx).await {
+        if let Err(e) =
+            stream_response_with_drafts(&bot, &msg, &config, rx, cancel, cancel_registry).await
+        {
             error!("Stream response error: {e}");
         }
     });
@@ -115,12 +130,17 @@ pub fn spawn_drain_task(
 /// Stream the gemini-cli response to the user, handling file attachments.
 ///
 /// Edits a placeholder message in-place as lines arrive.
-/// Final response committed with HTML formatting.
+/// Final response committed with HTML formatting; long responses are split
+/// into multiple Telegram messages.
+///
+/// An inline keyboard with a "Stop" button is shown during streaming.
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
     _config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
+    cancel: CancellationToken,
+    cancel_registry: CancelRegistry,
 ) -> Result<()> {
     let mut accumulated = String::new();
     let mut last_update = Instant::now();
@@ -133,8 +153,9 @@ pub async fn stream_response_with_drafts(
         .await
         .ok();
 
-    // Send instant placeholder so the user sees activity right away.
+    // Send instant placeholder with a "Stop" inline button.
     let mut placeholder_id: Option<teloxide::types::MessageId> = None;
+    let mut callback_key = String::new();
     {
         let mut req = bot.send_message(msg.chat.id, "⏳");
         if let Some(tid) = msg.thread_id {
@@ -142,92 +163,191 @@ pub async fn stream_response_with_drafts(
         }
         if let Ok(sent) = req.disable_notification(true).await {
             placeholder_id = Some(sent.id);
+            // Build callback key and register the cancellation token.
+            callback_key = format!("stop:{}:{}", msg.chat.id.0, sent.id.0);
+            cancel_registry.insert(callback_key.clone(), cancel.clone());
+            // Attach inline keyboard with the Stop button.
+            let kb = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("🛑 Stop", &callback_key),
+            ]]);
+            bot.edit_message_reply_markup(msg.chat.id, sent.id)
+                .reply_markup(kb)
+                .await
+                .ok();
         }
     }
 
-    while let Some(line) = rx.recv().await {
-        // Intercept file attachments.
-        if line.starts_with("ATTACH_FILE:") {
-            let path_str = line.trim_start_matches("ATTACH_FILE:").trim();
-            let path = Path::new(path_str);
-            if path.exists() {
-                let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
+    let mut was_cancelled = false;
+
+    loop {
+        tokio::select! {
+            line = rx.recv() => {
+                let Some(line) = line else { break };
+
+                // Intercept file attachments.
+                if line.starts_with("ATTACH_FILE:") {
+                    let path_str = line.trim_start_matches("ATTACH_FILE:").trim();
+                    let path = Path::new(path_str);
+                    if path.exists() {
+                        let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
+                        if let Some(tid) = msg.thread_id {
+                            req = req.message_thread_id(tid);
+                        }
+                        if let Err(e) = req.await {
+                            error!("Failed to send document: {e}");
+                        }
+                    }
+                    continue;
+                }
+
+                // Skip consecutive duplicate non-empty lines.
+                if line == last_line && !line.is_empty() {
+                    continue;
+                }
+                last_line = line.clone();
+
+                // Accumulate.
+                if !accumulated.is_empty() {
+                    accumulated.push('\n');
+                }
+                accumulated.push_str(&line);
+
+                // Refresh typing indicator periodically.
+                if last_typing.elapsed() >= TYPING_INTERVAL {
+                    bot.send_chat_action(msg.chat.id, ChatAction::Typing)
+                        .await
+                        .ok();
+                    last_typing = Instant::now();
+                }
+
+                // Stream updates by editing the placeholder message.
+                if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
+                    if let Some(pid) = placeholder_id {
+                        bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
+                            .await
+                            .ok();
+                    }
+                    last_update = Instant::now();
+                }
+            }
+            _ = cancel.cancelled() => {
+                was_cancelled = true;
+                break;
+            }
+        }
+    }
+
+    // Clean up: remove cancellation token from registry.
+    if !callback_key.is_empty() {
+        cancel_registry.remove(&callback_key);
+    }
+
+    // Remove the inline keyboard from the placeholder.
+    if let Some(pid) = placeholder_id {
+        bot.edit_message_reply_markup(msg.chat.id, pid).await.ok();
+    }
+
+    // Build suffix for cancelled messages.
+    let cancel_suffix = if was_cancelled {
+        "\n\n⬛ Generation stopped"
+    } else {
+        ""
+    };
+
+    // Final commit.
+    if accumulated.is_empty() {
+        let empty_msg = if was_cancelled {
+            "⬛ Generation stopped"
+        } else {
+            "_(no response)_"
+        };
+        if let Some(pid) = placeholder_id {
+            bot.edit_message_text(msg.chat.id, pid, empty_msg)
+                .await
+                .ok();
+        }
+        return Ok(());
+    }
+
+    let html = format!(
+        "{}{}",
+        markdown_to_telegram_html(&accumulated),
+        if was_cancelled {
+            "\n\n⬛ <i>Generation stopped</i>"
+        } else {
+            ""
+        }
+    );
+    let chunks = split_text(&html);
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            if let Some(pid) = placeholder_id {
+                let edit_res = bot
+                    .edit_message_text(msg.chat.id, pid, chunk)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                if let Err(e) = edit_res {
+                    tracing::warn!("HTML format failed: {e}, falling back to plain text");
+                    let plain = format!("{}{}", accumulated, cancel_suffix);
+                    let plain_chunks = split_text(&plain);
+                    bot.edit_message_text(msg.chat.id, pid, &plain_chunks[0])
+                        .await
+                        .ok();
+                    for plain_chunk in &plain_chunks[1..] {
+                        let mut req = bot.send_message(msg.chat.id, plain_chunk);
+                        if let Some(tid) = msg.thread_id {
+                            req = req.message_thread_id(tid);
+                        }
+                        req.await.ok();
+                    }
+                    return Ok(());
+                }
+            } else {
+                let mut req = bot.send_message(msg.chat.id, chunk)
+                    .parse_mode(ParseMode::Html);
                 if let Some(tid) = msg.thread_id {
                     req = req.message_thread_id(tid);
                 }
-                if let Err(e) = req.await {
-                    error!("Failed to send document: {e}");
-                }
+                req.await.ok();
             }
-            continue;
-        }
-
-        // Skip consecutive duplicate non-empty lines (gemini-cli --resume can replay history).
-        if line == last_line && !line.is_empty() {
-            continue;
-        }
-        last_line = line.clone();
-
-        // Accumulate with newlines for paragraph separation.
-        if !accumulated.is_empty() {
-            accumulated.push('\n');
-        }
-        accumulated.push_str(&line);
-
-        // Refresh typing indicator periodically.
-        if last_typing.elapsed() >= TYPING_INTERVAL {
-            bot.send_chat_action(msg.chat.id, ChatAction::Typing)
-                .await
-                .ok();
-            last_typing = Instant::now();
-        }
-
-        // Stream updates by editing the placeholder message.
-        if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
-            if let Some(pid) = placeholder_id {
-                bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
-                    .await
-                    .ok();
-            }
-            last_update = Instant::now();
-        }
-    }
-
-    // Final edit — commit the complete response as a persistent message.
-    let final_text = if accumulated.is_empty() {
-        "(no response)".to_string()
-    } else {
-        let html = markdown_to_telegram_html(&accumulated);
-        truncate_text(&html)
-    };
-
-    if let Some(pid) = placeholder_id {
-        let edit_res = bot
-            .edit_message_text(msg.chat.id, pid, &final_text)
-            .parse_mode(ParseMode::Html)
-            .await;
-        if let Err(e) = edit_res {
-            // HTML parse error — fallback to plain text.
-            tracing::warn!("HTML format failed: {e}, falling back to plain text");
-            let plain = truncate_text(&accumulated);
-            bot.edit_message_text(msg.chat.id, pid, &plain).await.ok();
-        }
-    } else {
-        // No placeholder was ever sent.
-        let send_res = bot
-            .send_message(msg.chat.id, &final_text)
-            .parse_mode(ParseMode::Html)
-            .await;
-        if let Err(_) = send_res {
-            let plain = truncate_text(&accumulated);
-            let mut req = bot.send_message(msg.chat.id, &plain);
+        } else {
+            let mut req = bot.send_message(msg.chat.id, chunk)
+                .parse_mode(ParseMode::Html);
             if let Some(tid) = msg.thread_id {
                 req = req.message_thread_id(tid);
             }
-            req.await.ok();
+            if let Err(_) = req.await {
+                let mut req = bot.send_message(msg.chat.id, chunk);
+                if let Some(tid) = msg.thread_id {
+                    req = req.message_thread_id(tid);
+                }
+                req.await.ok();
+            }
         }
     }
 
+    Ok(())
+}
+
+/// Handle the "Stop" inline button callback.
+pub async fn handle_stop_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    cancel_registry: CancelRegistry,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(data) = &q.data {
+        if data.starts_with("stop:") {
+            if let Some((_, token)) = cancel_registry.remove(data) {
+                token.cancel();
+            }
+        }
+    }
+    // Acknowledge the callback to dismiss the spinner on the button.
+    bot.answer_callback_query(&q.id)
+        .text("🛑 Stopped")
+        .await
+        .ok();
     Ok(())
 }
 
@@ -418,7 +538,8 @@ fn find_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
     }
 }
 
-/// Truncate text to Telegram's 4096-character limit.
+/// Truncate text to Telegram's 4096-character limit (used for interim draft
+/// updates only — the final response uses `split_text` instead).
 fn truncate_text(text: &str) -> String {
     const MAX: usize = 4096;
     if text.chars().count() <= MAX {
@@ -427,6 +548,43 @@ fn truncate_text(text: &str) -> String {
         let truncated: String = text.chars().take(MAX - 1).collect();
         format!("{truncated}…")
     }
+}
+
+/// Split text into chunks that each fit within Telegram's 4096-character limit.
+///
+/// Splits on newline boundaries when possible to avoid breaking mid-sentence.
+fn split_text(text: &str) -> Vec<String> {
+    const MAX: usize = 4096;
+    if text.chars().count() <= MAX {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        let char_count = remaining.chars().count();
+        if char_count <= MAX {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        // Find a newline boundary within the limit to split on.
+        let byte_limit = remaining
+            .char_indices()
+            .nth(MAX)
+            .map(|(i, _)| i)
+            .unwrap_or(remaining.len());
+        let split_at = remaining[..byte_limit]
+            .rfind('\n')
+            .map(|pos| pos + 1) // Include the newline in current chunk
+            .unwrap_or(byte_limit); // No newline found — hard split at limit
+
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+
+    chunks
 }
 
 #[cfg(test)]
@@ -464,6 +622,67 @@ mod tests {
         let result = truncate_text(&text);
         assert!(result.ends_with('…'));
         assert_eq!(result.chars().count(), 4096);
+    }
+
+    // ── split_text ───────────────────────────────────────────────────────
+
+    #[test]
+    fn split_short_text_single_chunk() {
+        let text = "Hello, world!";
+        let chunks = split_text(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn split_empty_string_single_chunk() {
+        let chunks = split_text("");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "");
+    }
+
+    #[test]
+    fn split_exactly_at_limit_single_chunk() {
+        let text: String = "a".repeat(4096);
+        let chunks = split_text(&text);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn split_over_limit_multiple_chunks() {
+        // Build text with newlines so splitting is predictable.
+        let line = "abcdefghij\n"; // 11 chars per line
+        let text: String = line.repeat(500); // 5500 chars
+        let chunks = split_text(&text);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 4096);
+        }
+        // Joined chunks should reconstruct the original text.
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn split_unicode_text() {
+        let line = "Привет мир!\n"; // ~12 chars per line
+        let text: String = line.repeat(500);
+        let chunks = split_text(&text);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 4096);
+        }
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn split_no_newlines_hard_splits() {
+        let text: String = "a".repeat(5000);
+        let chunks = split_text(&text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), 4096);
+        assert_eq!(chunks[1].chars().count(), 904);
     }
 
     #[test]
@@ -567,6 +786,192 @@ mod tests {
         assert_eq!(
             markdown_to_telegram_html("This is **bold** and *italic*"),
             "This is <b>bold</b> and <i>italic</i>"
+        );
+    }
+
+    // ── CancelRegistry ──────────────────────────────────────────────────
+
+    #[test]
+    fn cancel_registry_insert_and_remove() {
+        let registry: CancelRegistry = Arc::new(DashMap::new());
+        let token = CancellationToken::new();
+        registry.insert("stop:123:456".to_string(), token.clone());
+
+        assert_eq!(registry.len(), 1);
+        assert!(!token.is_cancelled());
+
+        let (_, removed) = registry.remove("stop:123:456").expect("should exist");
+        removed.cancel();
+        assert!(token.is_cancelled());
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn cancel_registry_remove_nonexistent_returns_none() {
+        let registry: CancelRegistry = Arc::new(DashMap::new());
+        assert!(registry.remove("stop:999:999").is_none());
+    }
+
+    #[test]
+    fn cancel_registry_multiple_tokens_isolated() {
+        let registry: CancelRegistry = Arc::new(DashMap::new());
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        registry.insert("stop:1:1".to_string(), token_a.clone());
+        registry.insert("stop:2:2".to_string(), token_b.clone());
+
+        assert_eq!(registry.len(), 2);
+
+        // Cancel only token A.
+        if let Some((_, t)) = registry.remove("stop:1:1") {
+            t.cancel();
+        }
+        assert!(token_a.is_cancelled());
+        assert!(!token_b.is_cancelled());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn cancel_token_propagates_to_clones() {
+        let token = CancellationToken::new();
+        let clone1 = token.clone();
+        let clone2 = token.clone();
+
+        assert!(!clone1.is_cancelled());
+        assert!(!clone2.is_cancelled());
+
+        token.cancel();
+
+        assert!(clone1.is_cancelled());
+        assert!(clone2.is_cancelled());
+    }
+
+    // ── split_text edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn split_three_or_more_chunks() {
+        // 12288 chars > 3 * 4096 → should produce 3 chunks.
+        let line = "abcdefghij\n"; // 11 chars
+        let text: String = line.repeat(1200); // 13200 chars
+        let chunks = split_text(&text);
+        assert!(chunks.len() >= 3);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 4096);
+        }
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn split_preserves_newline_boundaries() {
+        // Ensure we split at \n, not in the middle of a word.
+        let mut text = String::new();
+        for i in 0..500 {
+            text.push_str(&format!("Line number {i:04}\n"));
+        }
+        let chunks = split_text(&text);
+        for chunk in &chunks {
+            // Every chunk (except possibly the last) should end with \n.
+            if chunk.chars().count() == 4096 {
+                // Hard-split case — allowed but unlikely with these short lines.
+            } else if !chunk.is_empty() {
+                assert!(
+                    chunk.ends_with('\n') || chunk == chunks.last().unwrap(),
+                    "Expected chunk to end with newline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_emoji_heavy_text() {
+        // Each emoji is 1 char but 4 bytes — verify char-based splitting.
+        let line = "🎉🎊🎈🎁🎀\n"; // 6 chars per line
+        let text: String = line.repeat(1000); // 6000 chars
+        let chunks = split_text(&text);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 4096);
+        }
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn split_single_long_line_with_trailing() {
+        // Long first line + short second line.
+        let long = "x".repeat(4000);
+        let text = format!("{long}\nshort line");
+        let chunks = split_text(&text);
+        assert_eq!(chunks.len(), 1); // 4011 chars < 4096
+    }
+
+    #[test]
+    fn split_exactly_double_limit() {
+        let text: String = "a".repeat(8192);
+        let chunks = split_text(&text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 4096);
+        assert_eq!(chunks[1].len(), 4096);
+    }
+
+    // ── markdown edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn test_markdown_horizontal_rules() {
+        assert_eq!(markdown_to_telegram_html("---"), "—————");
+        assert_eq!(markdown_to_telegram_html("***"), "—————");
+    }
+
+    #[test]
+    fn test_markdown_blockquotes() {
+        assert_eq!(
+            markdown_to_telegram_html("> This is a quote"),
+            "<blockquote>This is a quote</blockquote>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("> **Bold** quote"),
+            "<blockquote><b>Bold</b> quote</blockquote>"
+        );
+    }
+
+    #[test]
+    fn test_markdown_empty_string() {
+        assert_eq!(markdown_to_telegram_html(""), "");
+    }
+
+    #[test]
+    fn test_markdown_mixed_content() {
+        let md = "# Title\n\nSome **bold** text\n\n- Item 1\n- Item 2\n\n```\ncode\n```\n\n> Quote";
+        let html = markdown_to_telegram_html(md);
+        assert!(html.contains("<b>Title</b>"));
+        assert!(html.contains("<b>bold</b>"));
+        assert!(html.contains("• Item 1"));
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("<blockquote>"));
+    }
+
+    #[test]
+    fn test_markdown_link_with_special_chars() {
+        assert_eq!(
+            markdown_to_telegram_html("[docs](https://example.com/path?a=1&b=2)"),
+            "<a href=\"https://example.com/path?a=1\u{26}amp;b=2\">docs</a>"
+        );
+    }
+
+    #[test]
+    fn test_escape_html_all_entities() {
+        assert_eq!(escape_html("<>&"), "&lt;&gt;&amp;");
+        assert_eq!(escape_html("normal text"), "normal text");
+        assert_eq!(escape_html(""), "");
+        assert_eq!(escape_html("a < b > c & d"), "a &lt; b &gt; c &amp; d");
+    }
+
+    #[test]
+    fn test_markdown_dash_bullet_with_inline() {
+        assert_eq!(
+            markdown_to_telegram_html("- **bold** item"),
+            "• <b>bold</b> item"
         );
     }
 }

@@ -2741,6 +2741,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2766,6 +2767,7 @@ dependencies = [
  "tar",
  "teloxide",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "transcribe-rs",
