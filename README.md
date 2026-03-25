@@ -32,7 +32,7 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 |---|---|---|
 | 💬 | **Real-time streaming** | Responses streamed line-by-line via `sendMessageDraft` with Markdown formatting and plain-text fallback |
 | ⏳ | **Instant feedback** | "⏳" placeholder sent immediately — no dead silence while gemini-cli starts |
-| 🛑 | **Stop generation** | Inline "🛑 Остановить" button to cancel generation mid-stream — kills gemini-cli instantly |
+| 🛑 | **Stop generation** | Inline "🛑 Stop" button to cancel generation mid-stream — kills gemini-cli instantly |
 | 📝 | **Smart message splitting** | Long responses auto-split into multiple Telegram messages at newline boundaries — no truncation |
 | ⚠️ | **Error feedback** | Errors and timeouts (5 min) are reported to the user instead of silent failure |
 | 📷 | **Photo analysis** | Send photos (including albums) — batched via aggregator and analyzed by Gemini Vision |
@@ -186,7 +186,7 @@ stateDiagram-v2
     Query --> Placeholder: ⏳ + 🛑 Stop button
     Placeholder --> Streaming: line-by-line via BufReader
     Streaming --> Cancelled: user clicks 🛑
-    Cancelled --> Ready: ⬛ Генерация остановлена
+    Cancelled --> Ready: ⬛ Generation stopped
     Streaming --> Ready: response committed (Markdown)
     Ready --> [*]: /new (reset)
 ```
