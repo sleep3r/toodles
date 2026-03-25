@@ -167,9 +167,10 @@ pub async fn stream_response_with_drafts(
             callback_key = format!("stop:{}:{}", msg.chat.id.0, sent.id.0);
             cancel_registry.insert(callback_key.clone(), cancel.clone());
             // Attach inline keyboard with the Stop button.
-            let kb = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback("🛑 Stop", &callback_key),
-            ]]);
+            let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                "🛑 Stop",
+                &callback_key,
+            )]]);
             bot.edit_message_reply_markup(msg.chat.id, sent.id)
                 .reply_markup(kb)
                 .await
@@ -304,7 +305,8 @@ pub async fn stream_response_with_drafts(
                     return Ok(());
                 }
             } else {
-                let mut req = bot.send_message(msg.chat.id, chunk)
+                let mut req = bot
+                    .send_message(msg.chat.id, chunk)
                     .parse_mode(ParseMode::Html);
                 if let Some(tid) = msg.thread_id {
                     req = req.message_thread_id(tid);
@@ -312,7 +314,8 @@ pub async fn stream_response_with_drafts(
                 req.await.ok();
             }
         } else {
-            let mut req = bot.send_message(msg.chat.id, chunk)
+            let mut req = bot
+                .send_message(msg.chat.id, chunk)
                 .parse_mode(ParseMode::Html);
             if let Some(tid) = msg.thread_id {
                 req = req.message_thread_id(tid);

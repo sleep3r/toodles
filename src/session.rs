@@ -210,15 +210,16 @@ impl Session {
                 }
                 Ok(Err(e)) => {
                     error!("Failed to wait for gemini-cli: {e}");
-                    let _ = tx
-                        .send(format!("\n⚠️ Ошибка gemini-cli: {e}"))
-                        .await;
+                    let _ = tx.send(format!("\n⚠️ Ошибка gemini-cli: {e}")).await;
                 }
                 Err(_) => {
                     error!("gemini-cli timed out after 300s! Killing process.");
                     let _ = child.kill().await;
                     let _ = tx
-                        .send("\n⚠️ gemini-cli не ответил (таймаут 5 минут). Попробуйте снова.".to_string())
+                        .send(
+                            "\n⚠️ gemini-cli не ответил (таймаут 5 минут). Попробуйте снова."
+                                .to_string(),
+                        )
                         .await;
                 }
                 _ => {}
@@ -477,7 +478,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "Query should complete quickly when cancelled");
+        assert!(
+            result.is_ok(),
+            "Query should complete quickly when cancelled"
+        );
     }
 
     #[tokio::test]
