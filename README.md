@@ -30,23 +30,26 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 
 | | Feature | Details |
 |---|---|---|
-| 💬 | **Real-time streaming** | Responses streamed line-by-line via `sendMessageDraft` with Markdown formatting and plain-text fallback |
-| ⏳ | **Instant feedback** | "⏳" placeholder sent immediately — no dead silence while gemini-cli starts |
-| 🛑 | **Stop generation** | Inline "🛑 Stop" button to cancel generation mid-stream — kills gemini-cli instantly |
+| 💬 | **Real-time streaming** | In-place draft updates while the model is generating, then final formatted commit |
+| ⏳ | **Instant feedback** | Immediate startup placeholder (`Подключаю Gemini-сессию…`) on cold starts |
+| 🛑 | **Stop generation** | Inline "🛑 Stop" button to cancel generation mid-stream |
 | 📝 | **Smart message splitting** | Long responses auto-split into multiple Telegram messages at newline boundaries — no truncation |
-| ⚠️ | **Error feedback** | Errors and timeouts (5 min) are reported to the user instead of silent failure |
+| ⚠️ | **Error feedback** | Session startup and runtime errors are surfaced to the user (no silent failure) |
 | 📷 | **Photo analysis** | Send photos (including albums) — batched via aggregator and analyzed by Gemini Vision |
 | 📄 | **Document handling** | Send files (PDF, XLSX, etc.) — downloaded and forwarded to gemini-cli for processing |
 | 📎 | **File sharing** | Gemini can send files back via the `ATTACH_FILE:` protocol |
 | 🧩 | **Message aggregation** | Sequential messages within 1.5s are batched into a single prompt — handles albums, forwarded batches, and split messages |
+| 🔥 | **Warm session pool** | Keeps prewarmed ACP sessions to reduce first-response latency (`WARM_SESSION_POOL_SIZE`) |
+| ♻️ | **Session startup retries** | Automatic retry with backoff when ACP initialization fails transiently |
 | 🎙 | **Voice messages** | Transcribed locally via **Parakeet V3** or cloud via **OpenAI Whisper** |
 | 🧠 | **Local transcription** | Offline, no API keys — NVIDIA Parakeet ONNX (int8, ~478 MB) |
 | 📌 | **Forum topics** | Each Telegram topic gets an isolated gemini-cli session |
+| 🏷️ | **Thread auto-title** | First message sets topic title; later updates use recent-context summaries |
 | 🔄 | **Session management** | `/new` starts fresh, `/status` shows active count |
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
 | 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
-| ✅ | **Tested** | 68 unit tests covering aggregator, config, session management, cancellation, message splitting, and handler utilities |
+| ✅ | **CI-gated** | `check + fmt + clippy + test` on every push/PR |
 
 ## 🚀 Quick Start
 
@@ -88,11 +91,11 @@ make run-release    # run optimized
 
 1. User sends a message (text, photo, document, or voice)
 2. Messages are aggregated within a 1.5s window (handles albums and split messages)
-3. An instant "⏳" placeholder is sent with a 🛑 **Stop** inline button
-4. The query is streamed — each stdout line from gemini-cli is forwarded to Telegram via `sendMessageDraft`
-5. User can press **Stop** at any time — gemini-cli is killed instantly via `CancellationToken`
-6. Final response is committed with Markdown formatting, split into multiple messages if needed (with automatic plain-text fallback)
-7. Subsequent messages reuse the session via `--resume latest`
+3. On cold start, a startup status is shown while ACP session is created (or grabbed from warm pool)
+4. A draft placeholder with 🛑 **Stop** is attached and updated during generation
+5. User can press **Stop** at any time — generation is cancelled via `CancellationToken`
+6. Final response is committed with Markdown→Telegram HTML formatting and plain-text fallback
+7. Subsequent messages reuse the same topic/chat session automatically
 
 ## 🎙 Voice Transcription
 
@@ -135,6 +138,7 @@ GEMINI_WORKING_DIR=/path/to/project   # optional cwd
 GEMINI_YOLO=true                      # optional auto-approve mode
 DRAFT_MODE=verbose                    # compact | verbose draft UX
 THREAD_RENAME_EVERY=4                 # 0 disables auto-rename
+WARM_SESSION_POOL_SIZE=1              # 0 disables warm prewarmed pool
 
 # Optional: read additional settings from TOML
 TOODLES_CONFIG=~/.config/toodles/config.toml
@@ -166,6 +170,7 @@ gemini_working_dir = "/path/to/project"
 gemini_yolo = true
 draft_mode = "verbose"
 thread_rename_every = 4
+warm_session_pool_size = 1
 ```
 
 You can copy `config.example.toml` as a starting point.
@@ -183,6 +188,16 @@ You can copy `config.example.toml` as a starting point.
 `/thread` works in forum-enabled supergroups where the bot has topic-management rights.
 You can call `/thread` from both the main chat and existing topics; Toodles creates a new topic in the same group.
 The first user message in a topic sets its initial title, then Toodles refreshes the title every `THREAD_RENAME_EVERY` messages using the recent message context.
+
+## 🧯 Cold-Start Tuning
+
+If the first response sometimes takes too long:
+
+- Set `WARM_SESSION_POOL_SIZE=1` (or `2`) to keep prewarmed ACP sessions ready.
+- Keep `GEMINI_WORKING_DIR` on a local SSD path (avoid slow network mounts).
+- Check bot logs for repeated ACP initialize retries; transient failures are retried automatically.
+
+If `/thread` fails with "not enough rights to create a topic", grant the bot admin permission to manage topics.
 
 ## 📐 Architecture
 
@@ -218,7 +233,7 @@ stateDiagram-v2
     Ready --> [*]: /new (reset)
 ```
 
-Each chat or forum topic maps to an isolated gemini-cli session. Queries are serialised per session via `tokio::sync::Mutex`. Responses are streamed in real time — each line from gemini-cli stdout is sent to Telegram immediately via `sendMessageDraft` (with `edit_message_text` commit). Users can cancel generation mid-stream via an inline keyboard button, which triggers a `CancellationToken` to kill the gemini-cli process. Long responses are automatically split across multiple Telegram messages at newline boundaries. Sequential messages and photo albums are aggregated via a 1.5s debounce window. Temporary files (photos, documents) are kept alive via `Arc<TempFileGuard>` in the aggregator until the query completes.
+Each chat or forum topic maps to an isolated ACP session. Queries are serialised per session via `tokio::sync::Mutex` and a per-session queue. Startup uses retries and an optional warm pool (`WARM_SESSION_POOL_SIZE`) to reduce first-token latency. During generation, the bot updates one placeholder message (draft UX), supports inline cancellation via `CancellationToken`, and commits a final Markdown→Telegram HTML response with plain-text fallback. Long responses are split across multiple Telegram messages at newline boundaries. Sequential messages and photo albums are aggregated via a 1.5s debounce window. Temporary files (photos, documents) are kept alive via `Arc<TempFileGuard>` until the query completes.
 
 ## 🛠 Makefile
 

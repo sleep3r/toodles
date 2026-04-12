@@ -52,6 +52,10 @@ pub struct Config {
     /// Rename forum topic title every N user messages in that thread.
     /// Set to 0 to disable automatic renaming.
     pub thread_rename_every: usize,
+
+    /// Number of idle prewarmed ACP sessions to keep ready.
+    /// Set to 0 to disable hot session pool.
+    pub warm_session_pool_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -77,6 +81,7 @@ struct FileConfig {
     system_prompt: Option<String>,
     draft_mode: Option<String>,
     thread_rename_every: Option<usize>,
+    warm_session_pool_size: Option<usize>,
     gemini: Option<FileGeminiConfig>,
 }
 
@@ -206,6 +211,16 @@ impl Config {
             .or_else(|| file_config.as_ref().and_then(|cfg| cfg.thread_rename_every))
             .unwrap_or(4);
 
+        let warm_session_pool_size = env::var("WARM_SESSION_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.warm_session_pool_size)
+            })
+            .unwrap_or(1);
+
         Ok(Self {
             telegram_bot_token,
             allowed_user_ids,
@@ -218,6 +233,7 @@ impl Config {
             system_prompt,
             draft_mode,
             thread_rename_every,
+            warm_session_pool_size,
         })
     }
 
@@ -322,6 +338,7 @@ mod tests {
             system_prompt: None,
             draft_mode: DraftMode::Verbose,
             thread_rename_every: 4,
+            warm_session_pool_size: 1,
         }
     }
 

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +76,14 @@ impl Session {
         if yolo {
             match conn.set_session_mode(&session_id, "yolo").await {
                 Ok(_) => info!("ACP session mode set to yolo"),
-                Err(e) => warn!("Failed to set yolo mode (will use default): {e}"),
+                Err(e) => {
+                    let text = e.to_string();
+                    if text.contains("Method not found") {
+                        debug!("ACP agent does not support session/set-mode; continuing");
+                    } else {
+                        warn!("Failed to set yolo mode (will use default): {e}");
+                    }
+                }
             }
         }
 
@@ -205,21 +213,12 @@ async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
             // their own whitespace/newlines.
             let _ = tx.send(text).await;
         }
-        AcpEvent::ToolCall {
-            title,
-            kind: _,
-            id: _,
-            status,
-        } => {
+        AcpEvent::ToolCall { title, status } => {
             if status == "pending" {
                 emit_stream_event(tx, "tool", Some("pending"), Some(&title)).await;
             }
         }
-        AcpEvent::ToolCallUpdate {
-            id: _,
-            status,
-            content,
-        } => {
+        AcpEvent::ToolCallUpdate { status, content } => {
             if status == "completed" {
                 let text = content
                     .as_deref()
@@ -254,9 +253,6 @@ async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
                 )),
             )
             .await;
-        }
-        AcpEvent::Finished => {
-            // No-op, the prompt response handles completion.
         }
         AcpEvent::Error(e) => {
             emit_stream_event(tx, "error", None, Some(e.as_str())).await;
@@ -293,6 +289,7 @@ fn truncate(s: &str, max: usize) -> String {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences from a string.
+#[cfg(test)]
 pub fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -319,6 +316,8 @@ pub struct SessionManager {
     sessions: DashMap<SessionKey, Arc<Mutex<Session>>>,
     message_counters: DashMap<SessionKey, usize>,
     recent_user_messages: DashMap<SessionKey, VecDeque<String>>,
+    warm_pool: Arc<Mutex<Vec<Arc<Mutex<Session>>>>>,
+    warm_refill_running: Arc<AtomicBool>,
     config: Arc<Config>,
 }
 
@@ -334,8 +333,47 @@ impl SessionManager {
             sessions: DashMap::new(),
             message_counters: DashMap::new(),
             recent_user_messages: DashMap::new(),
+            warm_pool: Arc::new(Mutex::new(Vec::new())),
+            warm_refill_running: Arc::new(AtomicBool::new(false)),
             config,
         }
+    }
+
+    /// Background-fill the warm ACP session pool up to configured target.
+    pub fn ensure_warm_pool_background(&self) {
+        let target = self.config.warm_session_pool_size;
+        if target == 0 {
+            return;
+        }
+
+        if self.warm_refill_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let pool = self.warm_pool.clone();
+        let running = self.warm_refill_running.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let pool_size = { pool.lock().await.len() };
+                if pool_size >= target {
+                    break;
+                }
+
+                match create_session_with_retries(config.clone(), None).await {
+                    Ok(session) => {
+                        pool.lock().await.push(Arc::new(Mutex::new(session)));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to fill warm ACP pool");
+                        break;
+                    }
+                }
+            }
+
+            running.store(false, Ordering::Release);
+        });
     }
 
     /// Returns whether an ACP session is already warm for this key.
@@ -422,63 +460,23 @@ impl SessionManager {
             return Ok((existing.value().clone(), false));
         }
 
-        let created = Arc::new(Mutex::new(self.create_session_with_retries(key).await?));
+        let maybe_warm = { self.warm_pool.lock().await.pop() };
+        let created = if let Some(warm) = maybe_warm {
+            info!(?key, "Using prewarmed ACP session from pool");
+            warm
+        } else {
+            Arc::new(Mutex::new(
+                create_session_with_retries(self.config.clone(), Some(key)).await?,
+            ))
+        };
 
         match self.sessions.entry(key) {
             Entry::Occupied(e) => Ok((e.get().clone(), false)),
             Entry::Vacant(e) => {
                 e.insert(created.clone());
+                self.ensure_warm_pool_background();
                 Ok((created, true))
             }
-        }
-    }
-
-    async fn create_session_with_retries(&self, key: SessionKey) -> Result<Session> {
-        const MAX_ATTEMPTS: usize = 3;
-        const BASE_RETRY_DELAY_MS: u64 = 600;
-
-        let mut last_error: Option<anyhow::Error> = None;
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            info!(
-                ?key,
-                attempt,
-                cmd = %self.config.gemini_cli_command,
-                "Creating ACP session"
-            );
-
-            match Session::new(
-                &self.config.gemini_cli_command,
-                self.config.gemini_working_dir.as_deref(),
-                self.config.gemini_yolo,
-                self.config.system_prompt.clone(),
-            )
-            .await
-            {
-                Ok(session) => {
-                    if attempt > 1 {
-                        info!(?key, attempt, "ACP session created after retry");
-                    }
-                    return Ok(session);
-                }
-                Err(e) => {
-                    warn!(?key, attempt, error = %e, "ACP session creation attempt failed");
-                    last_error = Some(e);
-                    if attempt < MAX_ATTEMPTS {
-                        let delay = Duration::from_millis(BASE_RETRY_DELAY_MS * attempt as u64);
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        }
-
-        match last_error {
-            Some(e) => Err(e.context(format!(
-                "Failed to create ACP session for gemini-cli after {MAX_ATTEMPTS} attempts"
-            ))),
-            None => Err(anyhow::anyhow!(
-                "Failed to create ACP session for gemini-cli"
-            )),
         }
     }
 
@@ -488,10 +486,16 @@ impl SessionManager {
         self.message_counters.remove(key);
         self.recent_user_messages.remove(key);
         info!("Session {:?} reset", key);
+        self.ensure_warm_pool_background();
     }
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Number of currently ready prewarmed sessions in the idle pool.
+    pub async fn warm_pool_ready_count(&self) -> usize {
+        self.warm_pool.lock().await.len()
     }
 }
 
@@ -506,6 +510,58 @@ fn normalize_for_title(text: &str) -> String {
         .to_string();
 
     compact.chars().take(MAX_SINGLE_MESSAGE_CHARS).collect()
+}
+
+async fn create_session_with_retries(
+    config: Arc<Config>,
+    key: Option<SessionKey>,
+) -> Result<Session> {
+    const MAX_ATTEMPTS: usize = 3;
+    const BASE_RETRY_DELAY_MS: u64 = 600;
+
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        info!(
+            ?key,
+            attempt,
+            cmd = %config.gemini_cli_command,
+            "Creating ACP session"
+        );
+
+        match Session::new(
+            &config.gemini_cli_command,
+            config.gemini_working_dir.as_deref(),
+            config.gemini_yolo,
+            config.system_prompt.clone(),
+        )
+        .await
+        {
+            Ok(session) => {
+                if attempt > 1 {
+                    info!(?key, attempt, "ACP session created after retry");
+                }
+                return Ok(session);
+            }
+            Err(e) => {
+                warn!(?key, attempt, error = %e, "ACP session creation attempt failed");
+                last_error = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    let delay = Duration::from_millis(BASE_RETRY_DELAY_MS * attempt as u64);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    match last_error {
+        Some(e) => Err(e.context(format!(
+            "Failed to create ACP session for gemini-cli after {MAX_ATTEMPTS} attempts"
+        ))),
+        None => Err(anyhow::anyhow!(
+            "Failed to create ACP session for gemini-cli"
+        )),
+    }
 }
 
 #[cfg(test)]

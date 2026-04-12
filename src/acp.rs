@@ -29,15 +29,9 @@ pub enum AcpEvent {
     /// Streaming text chunk from the agent's response.
     TextChunk(String),
     /// A tool call has been initiated.
-    ToolCall {
-        id: String,
-        title: String,
-        kind: String,
-        status: String,
-    },
+    ToolCall { title: String, status: String },
     /// Progress update for an ongoing tool call.
     ToolCallUpdate {
-        id: String,
         status: String,
         content: Option<String>,
     },
@@ -48,8 +42,6 @@ pub enum AcpEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     },
-    /// The prompt finished (channel will close after this).
-    Finished,
     /// An error occurred.
     Error(String),
 }
@@ -114,7 +106,6 @@ pub struct AcpConnection {
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
-    event_tx: mpsc::UnboundedSender<AcpEvent>,
     _child: Child,
 }
 
@@ -247,7 +238,6 @@ impl AcpConnection {
                 stdin,
                 next_id: AtomicU64::new(1),
                 pending,
-                event_tx,
                 _child: child,
             },
             event_rx,
@@ -319,7 +309,7 @@ impl AcpConnection {
 
     /// Initialize the ACP connection.
     pub async fn initialize(&self) -> Result<Value> {
-        self.request(
+        self.request_with_timeout(
             "initialize",
             serde_json::json!({
                 "protocolVersion": 1,
@@ -330,6 +320,7 @@ impl AcpConnection {
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            Duration::from_secs(180),
         )
         .await
     }
@@ -337,12 +328,13 @@ impl AcpConnection {
     /// Create a new ACP session.
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let result = self
-            .request(
+            .request_with_timeout(
                 "session/new",
                 serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": []
                 }),
+                Duration::from_secs(120),
             )
             .await?;
         let session_id = result["sessionId"]
@@ -389,11 +381,6 @@ impl AcpConnection {
             }),
         )
         .await
-    }
-
-    /// Get a clone of the event sender (for external monitoring).
-    pub fn event_tx(&self) -> mpsc::UnboundedSender<AcpEvent> {
-        self.event_tx.clone()
     }
 }
 
@@ -557,21 +544,11 @@ fn handle_notification(
             }
         }
         "tool_call" => {
-            let id = update["toolCallId"].as_str().unwrap_or("").to_string();
             let title = update["title"].as_str().unwrap_or("unknown").to_string();
-            let kind = update["kind"].as_str().unwrap_or("other").to_string();
             let status = update["status"].as_str().unwrap_or("pending").to_string();
-            event_tx
-                .send(AcpEvent::ToolCall {
-                    id,
-                    title,
-                    kind,
-                    status,
-                })
-                .ok();
+            event_tx.send(AcpEvent::ToolCall { title, status }).ok();
         }
         "tool_call_update" => {
-            let id = update["toolCallId"].as_str().unwrap_or("").to_string();
             let status = update["status"].as_str().unwrap_or("").to_string();
             let content = update["content"]
                 .as_array()
@@ -579,11 +556,7 @@ fn handle_notification(
                 .and_then(|c| c["content"]["text"].as_str())
                 .map(|s| s.to_string());
             event_tx
-                .send(AcpEvent::ToolCallUpdate {
-                    id,
-                    status,
-                    content,
-                })
+                .send(AcpEvent::ToolCallUpdate { status, content })
                 .ok();
         }
         "plan" => {

@@ -90,6 +90,7 @@ async fn command_handler(
         }
         Cmd::Status => {
             let count = sessions.session_count();
+            let warm_ready = sessions.warm_pool_ready_count().await;
             let thread = msg
                 .thread_id
                 .map(|t| t.0 .0.to_string())
@@ -102,8 +103,9 @@ async fn command_handler(
                 &bot,
                 &msg,
                 &format!(
-                    "📊 Active sessions: {count}\n🧵 Thread: {thread}\n🤖 Agent: gemini-cli\n📝 Draft mode: {draft_mode}\n🏷 Rename topic every: {} msgs",
-                    config.thread_rename_every
+                    "📊 Active sessions: {count}\n🧵 Thread: {thread}\n🤖 Agent: gemini-cli\n📝 Draft mode: {draft_mode}\n🏷 Rename topic every: {} msgs\n🔥 Warm pool: {warm_ready}/{} ready",
+                    config.thread_rename_every,
+                    config.warm_session_pool_size
                 ),
             )
             .await?;
@@ -226,6 +228,7 @@ async fn main() {
         gemini_yolo = config.gemini_yolo,
         draft_mode = ?config.draft_mode,
         thread_rename_every = config.thread_rename_every,
+        warm_session_pool_size = config.warm_session_pool_size,
         allowed_users = config.allowed_user_ids.len(),
         local_transcription = config.use_local_transcription,
         "Starting Toodles bot"
@@ -281,6 +284,7 @@ async fn main() {
     }
 
     let sessions = Arc::new(SessionManager::new(config.clone()));
+    sessions.ensure_warm_pool_background();
     let aggregator = Arc::new(MessageAggregator::new(Duration::from_millis(1500)));
     let cancel_registry: CancelRegistry = Arc::new(dashmap::DashMap::new());
     let query_registry: QueryRegistry = Arc::new(dashmap::DashMap::new());

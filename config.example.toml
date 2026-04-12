@@ -9,3 +9,4 @@ gemini_cli_command = "gemini --acp"
 gemini_yolo = true
 draft_mode = "verbose"
 thread_rename_every = 4
+warm_session_pool_size = 1
