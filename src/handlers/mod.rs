@@ -556,9 +556,14 @@ pub async fn stream_response_with_drafts(
         return Ok(());
     }
 
+    let mut final_text = accumulated.clone();
+    if sent_attachments.is_empty() {
+        final_text = maybe_send_inline_gpx_artifact(bot, msg, &accumulated).await;
+    }
+
     let html = format!(
         "{}{}",
-        markdown_to_telegram_html(&accumulated),
+        markdown_to_telegram_html(&final_text),
         if was_cancelled {
             "\n\n⬛ <i>Генерация остановлена</i>"
         } else {
@@ -591,7 +596,7 @@ pub async fn stream_response_with_drafts(
                     .await;
                 if let Err(e) = edit_res {
                     tracing::warn!("HTML format failed: {e}, falling back to plain text");
-                    let plain = format!("{}{}", accumulated, cancel_suffix);
+                    let plain = format!("{}{}", final_text, cancel_suffix);
                     let plain_chunks = split_text(&plain);
                     bot.edit_message_text(msg.chat.id, pid, &plain_chunks[0])
                         .await
@@ -789,6 +794,109 @@ fn tail_text(text: &str, max_chars: usize) -> String {
     let start_idx = total.saturating_sub(max_chars.saturating_sub(1));
     let tail: String = text.chars().skip(start_idx).collect();
     format!("…{tail}")
+}
+
+async fn maybe_send_inline_gpx_artifact(bot: &Bot, msg: &Message, response_text: &str) -> String {
+    let Some(gpx_payload) = extract_gpx_payload(response_text) else {
+        return response_text.to_string();
+    };
+
+    let file_name = guess_gpx_filename(response_text);
+    let temp_path = build_temp_output_path(&file_name);
+
+    if std::fs::write(&temp_path, gpx_payload.as_bytes()).is_err() {
+        return response_text.to_string();
+    }
+
+    let mut req = bot.send_document(msg.chat.id, InputFile::file(&temp_path));
+    if let Some(tid) = msg.thread_id {
+        req = req.message_thread_id(tid);
+    }
+
+    let send_ok = req.await.is_ok();
+    std::fs::remove_file(&temp_path).ok();
+
+    if !send_ok {
+        return response_text.to_string();
+    }
+
+    let note = format!("📎 Файл `{file_name}` отправлен вложением.");
+    response_text.replacen(&gpx_payload, &note, 1)
+}
+
+fn extract_gpx_payload(text: &str) -> Option<String> {
+    let gpx_start = text.find("<gpx")?;
+    let gpx_end_rel = text[gpx_start..].find("</gpx>")?;
+    let gpx_end = gpx_start + gpx_end_rel + "</gpx>".len();
+
+    let xml_start = text[..gpx_start]
+        .rfind("<?xml")
+        .filter(|idx| gpx_start.saturating_sub(*idx) < 512)
+        .unwrap_or(gpx_start);
+
+    let payload = text[xml_start..gpx_end].trim();
+    if payload.len() < 80 {
+        return None;
+    }
+
+    Some(payload.to_string())
+}
+
+fn guess_gpx_filename(text: &str) -> String {
+    let mut fallback = "route.gpx".to_string();
+
+    for raw in text.split_whitespace() {
+        let candidate = raw
+            .trim_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | ')' | '(')
+            })
+            .trim_start_matches("./")
+            .to_string();
+
+        if candidate.to_ascii_lowercase().ends_with(".gpx") && candidate.len() <= 120 {
+            let file = Path::new(&candidate)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(candidate);
+            let sanitized = sanitize_filename(&file);
+            if sanitized.to_ascii_lowercase().ends_with(".gpx") {
+                return sanitized;
+            }
+        }
+    }
+
+    if !fallback.to_ascii_lowercase().ends_with(".gpx") {
+        fallback.push_str(".gpx");
+    }
+    fallback
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if cleaned.is_empty() {
+        "route.gpx".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn build_temp_output_path(file_name: &str) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("toodles_{pid}_{millis}_{file_name}"))
 }
 
 async fn extract_text_and_send_attachments(
