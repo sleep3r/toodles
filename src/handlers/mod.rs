@@ -14,8 +14,8 @@ impl Drop for TempFileGuard {
     }
 }
 
-use std::collections::VecDeque;
-use std::path::Path;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -344,6 +344,8 @@ pub async fn stream_response_with_drafts(
     let mut last_line = String::new();
     let mut waiting_phase: usize = 0;
     let mut last_draft = String::new();
+    let mut attachment_tail = String::new();
+    let mut sent_attachments: HashSet<PathBuf> = HashSet::new();
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
     const WAITING_TICK_INTERVAL: Duration = Duration::from_secs(2);
@@ -420,35 +422,15 @@ pub async fn stream_response_with_drafts(
                     continue;
                 }
 
-                // Intercept file attachments — check each line within
-                // the chunk since ACP doesn't emit line-delimited chunks.
-                let mut has_file = false;
-                let mut text_parts = Vec::new();
-                for sub_line in line.split('\n') {
-                    if sub_line.starts_with("ATTACH_FILE:") {
-                        has_file = true;
-                        let path_str = sub_line.trim_start_matches("ATTACH_FILE:").trim();
-                        let path = Path::new(path_str);
-                        if path.exists() {
-                            let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
-                            if let Some(tid) = msg.thread_id {
-                                req = req.message_thread_id(tid);
-                            }
-                            if let Err(e) = req.await {
-                                error!("Failed to send document: {e}");
-                            }
-                        }
-                    } else {
-                        text_parts.push(sub_line);
-                    }
-                }
-
-                // Reconstruct non-attachment text.
-                let clean_text = if has_file {
-                    text_parts.join("\n")
-                } else {
-                    line.clone()
-                };
+                let clean_text = extract_text_and_send_attachments(
+                    bot,
+                    msg,
+                    config,
+                    &line,
+                    &mut attachment_tail,
+                    &mut sent_attachments,
+                )
+                .await;
 
                 if clean_text.is_empty() {
                     continue;
@@ -517,6 +499,26 @@ pub async fn stream_response_with_drafts(
                 was_cancelled = true;
                 break;
             }
+        }
+    }
+
+    // Flush buffered tail to catch attachment directives that arrived
+    // without a trailing newline.
+    if !attachment_tail.is_empty() {
+        let buffered_tail = std::mem::take(&mut attachment_tail);
+        let forced = format!("{}\n", buffered_tail);
+        let mut flush_tail = String::new();
+        let clean_tail = extract_text_and_send_attachments(
+            bot,
+            msg,
+            config,
+            &forced,
+            &mut flush_tail,
+            &mut sent_attachments,
+        )
+        .await;
+        if !clean_tail.is_empty() {
+            accumulated.push_str(&clean_tail);
         }
     }
 
@@ -787,6 +789,172 @@ fn tail_text(text: &str, max_chars: usize) -> String {
     let start_idx = total.saturating_sub(max_chars.saturating_sub(1));
     let tail: String = text.chars().skip(start_idx).collect();
     format!("…{tail}")
+}
+
+async fn extract_text_and_send_attachments(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    chunk: &str,
+    tail: &mut String,
+    sent_attachments: &mut HashSet<PathBuf>,
+) -> String {
+    let mut combined = String::new();
+    if !tail.is_empty() {
+        combined.push_str(tail);
+        tail.clear();
+    }
+    combined.push_str(chunk);
+
+    let ends_with_newline = combined.ends_with('\n');
+    let parts: Vec<&str> = combined.split('\n').collect();
+    let mut clean_text = String::new();
+
+    for (idx, raw_part) in parts.iter().enumerate() {
+        let is_last = idx + 1 == parts.len();
+        let line = raw_part.trim_end_matches('\r');
+
+        if is_last && !ends_with_newline {
+            if could_be_attachment_fragment(line) {
+                tail.push_str(raw_part);
+            } else {
+                clean_text.push_str(raw_part);
+            }
+            break;
+        }
+
+        if let Some(path_hint) = extract_attachment_hint(line) {
+            if let Some(path) = resolve_attachment_path(&path_hint, config) {
+                if sent_attachments.insert(path.clone()) {
+                    let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
+                    if let Some(tid) = msg.thread_id {
+                        req = req.message_thread_id(tid);
+                    }
+                    if let Err(e) = req.await {
+                        error!("Failed to send document: {e}");
+                    }
+                }
+            }
+        } else {
+            clean_text.push_str(raw_part);
+            clean_text.push('\n');
+        }
+    }
+
+    clean_text
+}
+
+fn extract_attachment_hint(line: &str) -> Option<String> {
+    const ATTACH_PREFIX: &str = "ATTACH_FILE:";
+
+    let normalized = normalize_attachment_line(line);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Some(pos) = normalized.find(ATTACH_PREFIX) {
+        let hint = normalized[pos + ATTACH_PREFIX.len()..].trim();
+        let hint = sanitize_path_hint(hint);
+        if !hint.is_empty() {
+            return Some(hint);
+        }
+    }
+
+    // Fallback: if the model outputs a standalone filename/path on a line
+    // (without ATTACH_FILE), try using it as attachment hint.
+    if !normalized.contains(' ') && normalized.contains('.') {
+        let hint = sanitize_path_hint(&normalized);
+        if !hint.is_empty() {
+            return Some(hint);
+        }
+    }
+
+    None
+}
+
+fn normalize_attachment_line(line: &str) -> String {
+    let mut s = line.trim().to_string();
+    for prefix in ["- ", "• ", "* "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start().to_string();
+            break;
+        }
+    }
+    s
+}
+
+fn sanitize_path_hint(raw: &str) -> String {
+    let mut s = raw
+        .trim()
+        .trim_matches(|c| c == '`' || c == '"' || c == '\'')
+        .to_string();
+
+    if let Some(stripped) = s.strip_prefix("file://") {
+        s = stripped.to_string();
+    }
+
+    while s
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, ',' | '.' | ';' | ':' | ')' | ']' | '>'))
+    {
+        s.pop();
+    }
+
+    s
+}
+
+fn resolve_attachment_path(path_hint: &str, config: &Config) -> Option<PathBuf> {
+    let expanded = expand_tilde(Path::new(path_hint));
+
+    if expanded.is_absolute() && expanded.exists() {
+        return Some(expanded);
+    }
+
+    if let Some(base) = config.gemini_working_dir.as_deref() {
+        let candidate = Path::new(base).join(&expanded);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    std::env::current_dir().ok().and_then(|cwd| {
+        let candidate = cwd.join(&expanded);
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
+}
+
+fn could_be_attachment_fragment(line: &str) -> bool {
+    const ATTACH_PREFIX: &str = "ATTACH_FILE:";
+
+    let normalized = normalize_attachment_line(line);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    normalized.contains(ATTACH_PREFIX)
+        || ATTACH_PREFIX.starts_with(normalized.as_str())
+        || normalized
+            .split_whitespace()
+            .last()
+            .is_some_and(|last| ATTACH_PREFIX.starts_with(last))
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(suffix);
+        }
+    }
+    path.to_path_buf()
 }
 
 async fn maybe_rename_thread_title(

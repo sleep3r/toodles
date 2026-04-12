@@ -528,7 +528,7 @@ fn handle_notification(
     );
 
     match update_type {
-        "agent_message_chunk" | "agent_thought_chunk" => {
+        "agent_message_chunk" => {
             // Try multiple paths for text content — the structure may vary.
             let text = update["content"]["text"]
                 .as_str()
@@ -543,6 +543,9 @@ fn handle_notification(
                 );
             }
         }
+        // Intentionally not forwarded to user-facing text stream.
+        // Keep model reasoning internal and surface only structured progress.
+        "agent_thought_chunk" => {}
         "tool_call" => {
             let title = update["title"].as_str().unwrap_or("unknown").to_string();
             let status = update["status"].as_str().unwrap_or("pending").to_string();
