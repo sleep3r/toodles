@@ -1,3 +1,4 @@
+mod acp;
 mod aggregator;
 mod config;
 mod handlers;
@@ -24,7 +25,7 @@ use handlers::{
     photo::handle_photo,
     session_key,
     voice::handle_voice,
-    CancelRegistry,
+    CancelRegistry, QueryRegistry,
 };
 use session::SessionManager;
 use transcription::LocalTranscriber;
@@ -42,6 +43,8 @@ enum Cmd {
     New,
     #[command(description = "Bot status 📊")]
     Status,
+    #[command(description = "Create forum thread 🧵")]
+    Thread,
     #[command(description = "Show commands 💡")]
     Help,
 }
@@ -63,6 +66,8 @@ async fn command_handler(
         return Ok(());
     }
 
+    let key = session_key(&msg);
+
     match cmd {
         Cmd::Start => {
             send_reply(
@@ -73,19 +78,101 @@ async fn command_handler(
                  Ask questions, get help with code, translations — anything.\n\n\
                  🎙 I understand voice messages — I'll transcribe and reply.\n\
                  📄 Send me files too — I'll figure them out!\n\n\
+                 /thread — Create a new forum thread\n\
                  /new — Start fresh\n\
                  /help — All commands",
             )
             .await?;
         }
         Cmd::New => {
-            let key = session_key(&msg);
             sessions.reset(&key).await;
             send_reply(&bot, &msg, "Done! Starting fresh.").await?;
         }
         Cmd::Status => {
             let count = sessions.session_count();
-            send_reply(&bot, &msg, &format!("📊 Active sessions: {count}")).await?;
+            let thread = msg
+                .thread_id
+                .map(|t| t.0 .0.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let draft_mode = match config.draft_mode {
+                crate::config::DraftMode::Compact => "compact",
+                crate::config::DraftMode::Verbose => "verbose",
+            };
+            send_reply(
+                &bot,
+                &msg,
+                &format!(
+                    "📊 Active sessions: {count}\n🧵 Thread: {thread}\n🤖 Agent: gemini-cli\n📝 Draft mode: {draft_mode}\n🏷 Rename topic every: {} msgs",
+                    config.thread_rename_every
+                ),
+            )
+            .await?;
+        }
+        Cmd::Thread => {
+            // Telegram currently allows only a fixed color set for forum topics.
+            const TOPIC_ICON_COLOR: u32 = 0x6FB9F0;
+            let icon_custom_emoji_id = bot
+                .get_forum_topic_icon_stickers()
+                .await
+                .ok()
+                .and_then(|stickers| {
+                    stickers
+                        .first()
+                        .and_then(|s| s.custom_emoji_id().map(|id| id.to_string()))
+                })
+                .unwrap_or_default();
+
+            match bot
+                .create_forum_topic(
+                    msg.chat.id,
+                    "Новая сессия",
+                    TOPIC_ICON_COLOR,
+                    icon_custom_emoji_id,
+                )
+                .await
+            {
+                Ok(topic) => {
+                    let topic_key = (msg.chat.id.0, Some(topic.thread_id.0 .0));
+                    sessions.reset(&topic_key).await;
+
+                    // Prewarm ACP session for this topic in background so the
+                    // first real prompt starts faster.
+                    let sessions_for_prewarm = sessions.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sessions_for_prewarm.get_or_create(topic_key).await {
+                            warn!("Failed to prewarm topic session: {e}");
+                        }
+                    });
+
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            "🐩 Thread is ready. Send your prompt here and I'll keep context isolated for this topic.",
+                        )
+                        .message_thread_id(topic.thread_id)
+                        .await;
+
+                    send_reply(
+                        &bot,
+                        &msg,
+                        &format!(
+                            "🧵 Forum thread created: `{}`. I also sent a welcome message into that topic.",
+                            topic.name
+                        ),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_reply(
+                        &bot,
+                        &msg,
+                        &format!(
+                            "⚠️ Could not create thread: {e}. Make sure this is a forum-enabled supergroup and bot has admin rights for topics."
+                        ),
+                    )
+                    .await?;
+                }
+            }
         }
         Cmd::Help => {
             send_reply(&bot, &msg, &Cmd::descriptions().to_string()).await?;
@@ -135,7 +222,10 @@ async fn main() {
     let config = Arc::new(config);
 
     info!(
-        gemini_cli = %config.gemini_cli_path,
+        gemini_cmd = %config.gemini_cli_command,
+        gemini_yolo = config.gemini_yolo,
+        draft_mode = ?config.draft_mode,
+        thread_rename_every = config.thread_rename_every,
         allowed_users = config.allowed_user_ids.len(),
         local_transcription = config.use_local_transcription,
         "Starting Toodles bot"
@@ -193,6 +283,7 @@ async fn main() {
     let sessions = Arc::new(SessionManager::new(config.clone()));
     let aggregator = Arc::new(MessageAggregator::new(Duration::from_millis(1500)));
     let cancel_registry: CancelRegistry = Arc::new(dashmap::DashMap::new());
+    let query_registry: QueryRegistry = Arc::new(dashmap::DashMap::new());
 
     let message_handler = Update::filter_message()
         // 1. Commands (must be checked before the plain-text handler).
@@ -222,7 +313,8 @@ async fn main() {
             sessions,
             local_transcriber,
             aggregator,
-            cancel_registry
+            cancel_registry,
+            query_registry
         ])
         .enable_ctrlc_handler()
         .build()

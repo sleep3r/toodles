@@ -130,7 +130,14 @@ ALLOWED_USER_IDS=123456789,987654321
 
 # Gemini CLI
 GEMINI_CLI_PATH=gemini                # path to binary
+GEMINI_CLI_COMMAND=gemini --acp       # optional full ACP command
 GEMINI_WORKING_DIR=/path/to/project   # optional cwd
+GEMINI_YOLO=true                      # optional auto-approve mode
+DRAFT_MODE=verbose                    # compact | verbose draft UX
+THREAD_RENAME_EVERY=4                 # 0 disables auto-rename
+
+# Optional: read additional settings from TOML
+TOODLES_CONFIG=~/.config/toodles/config.toml
 
 # System prompt — customise the bot's personality
 SYSTEM_PROMPT=You are a helpful AI assistant. Keep answers concise.
@@ -148,6 +155,21 @@ RUST_LOG=info
 
 > **💡 Tip:** Run `make setup` to generate this interactively!
 
+### Optional TOML config
+
+You can also keep settings in `~/.config/toodles/config.toml`:
+
+```toml
+bot_token = "123456:ABC-DEF..."
+gemini_cli_command = "gemini --acp"
+gemini_working_dir = "/path/to/project"
+gemini_yolo = true
+draft_mode = "verbose"
+thread_rename_every = 4
+```
+
+You can copy `config.example.toml` as a starting point.
+
 ## 🤖 Bot Commands
 
 | Command | Description |
@@ -155,15 +177,20 @@ RUST_LOG=info
 | `/start` | Get started 👋 |
 | `/new` | Start fresh 🔄 |
 | `/status` | Bot status 📊 |
+| `/thread` | Create forum thread 🧵 |
 | `/help` | Show commands 💡 |
+
+`/thread` works in forum-enabled supergroups where the bot has topic-management rights.
+You can call `/thread` from both the main chat and existing topics; Toodles creates a new topic in the same group.
+The first user message in a topic sets its initial title, then Toodles refreshes the title every `THREAD_RENAME_EVERY` messages using the recent message context.
 
 ## 📐 Architecture
 
 ```
 src/
 ├── main.rs             — entry point, dispatcher, bot commands
-├── config.rs           — Config from env vars
-├── session.rs          — gemini-cli subprocess management, streaming query
+├── config.rs           — Config from env + optional TOML (single gemini profile)
+├── session.rs          — ACP session lifecycle + per-chat/topic session mapping
 ├── aggregator.rs       — message batching with debounce window + file guard ownership
 ├── telegram_api.rs     — raw Telegram API (sendMessageDraft), global HTTP client
 ├── setup.rs            — interactive setup wizard (--setup)

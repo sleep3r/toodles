@@ -14,12 +14,14 @@ impl Drop for TempFileGuard {
     }
 }
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dashmap::DashMap;
+use serde::Deserialize;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ParseMode,
@@ -28,12 +30,30 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::aggregator::MessageAggregator;
-use crate::config::Config;
-use crate::session::{SessionKey, SessionManager};
+use crate::config::{Config, DraftMode};
+use crate::session::{SessionKey, SessionManager, STREAM_EVENT_PREFIX};
 
 /// Registry of active cancellation tokens, keyed by callback data string.
 /// Shared between the streaming task and the callback query handler.
 pub type CancelRegistry = Arc<DashMap<String, CancellationToken>>;
+
+/// Per-session query queue state.
+#[derive(Default)]
+pub(crate) struct SessionQueue {
+    running: bool,
+    pending: VecDeque<QueuedRequest>,
+}
+
+/// A queued user request waiting to be processed for a session.
+struct QueuedRequest {
+    msg: Message,
+    text: String,
+    files: Vec<String>,
+    guards: Vec<Arc<TempFileGuard>>,
+}
+
+/// Registry of per-session query queues.
+pub type QueryRegistry = Arc<DashMap<SessionKey, Arc<tokio::sync::Mutex<SessionQueue>>>>;
 
 /// Build the session key from a Telegram message.
 ///
@@ -59,6 +79,7 @@ pub fn spawn_drain_task(
     aggregator: Arc<MessageAggregator>,
     key: SessionKey,
     cancel_registry: CancelRegistry,
+    query_registry: QueryRegistry,
 ) {
     tokio::spawn(async move {
         // Wait for the aggregation deadline.
@@ -72,59 +93,231 @@ pub fn spawn_drain_task(
                 None => return,
             }
         };
-        let (combined_text, combined_files, _guards) = combined;
+        let (combined_text, combined_files, guards) = combined;
 
-        // Get or create the gemini-cli session.
-        let (session, _is_new) = match sessions.get_or_create(key).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to create session: {e}");
-                let err_msg = format!(
-                    "❌ Could not start gemini-cli.\n\
-                     Make sure `{}` is installed and on your PATH.\n\
-                     Error: {e}",
-                    config.gemini_cli_path
-                );
-                let mut req = bot.send_message(msg.chat.id, err_msg);
-                if let Some(tid) = msg.thread_id {
-                    req = req.message_thread_id(tid);
+        enqueue_query(
+            bot,
+            msg,
+            config,
+            sessions,
+            key,
+            combined_text,
+            combined_files,
+            guards,
+            cancel_registry,
+            query_registry,
+        )
+        .await;
+    });
+}
+
+/// Enqueue a user query for a session and run it when the session is free.
+pub async fn enqueue_query(
+    bot: Bot,
+    msg: Message,
+    config: Arc<Config>,
+    sessions: Arc<SessionManager>,
+    key: SessionKey,
+    text: String,
+    files: Vec<String>,
+    guards: Vec<Arc<TempFileGuard>>,
+    cancel_registry: CancelRegistry,
+    query_registry: QueryRegistry,
+) {
+    let queue_arc = query_registry
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(SessionQueue::default())))
+        .clone();
+
+    let request = QueuedRequest {
+        msg: msg.clone(),
+        text,
+        files,
+        guards,
+    };
+
+    let mut start_worker = false;
+    let queue_position;
+    {
+        let mut queue = queue_arc.lock().await;
+        queue.pending.push_back(request);
+        queue_position = queue.pending.len();
+        if !queue.running {
+            queue.running = true;
+            start_worker = true;
+        }
+    }
+
+    if !start_worker {
+        let text = if queue_position == 1 {
+            "⏳ Another request is running. Yours is queued next.".to_string()
+        } else {
+            format!("⏳ Request queued (position #{queue_position}).")
+        };
+        let mut req = bot
+            .send_message(msg.chat.id, text)
+            .disable_notification(true);
+        if let Some(tid) = msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        req.await.ok();
+        return;
+    }
+
+    tokio::spawn(process_queue_worker(
+        bot,
+        config,
+        sessions,
+        key,
+        cancel_registry,
+        query_registry,
+    ));
+}
+
+/// Process queued jobs for one session until the queue is empty.
+async fn process_queue_worker(
+    bot: Bot,
+    config: Arc<Config>,
+    sessions: Arc<SessionManager>,
+    key: SessionKey,
+    cancel_registry: CancelRegistry,
+    query_registry: QueryRegistry,
+) {
+    loop {
+        let queue_arc = query_registry.get(&key).map(|entry| entry.value().clone());
+        let Some(queue_arc) = queue_arc else {
+            return;
+        };
+
+        let maybe_request = {
+            let mut queue = queue_arc.lock().await;
+            match queue.pending.pop_front() {
+                Some(request) => Some(request),
+                None => {
+                    queue.running = false;
+                    None
                 }
-                req.await.ok();
-                return;
             }
         };
 
-        // Create a cancellation token for this query.
-        let cancel = CancellationToken::new();
-
-        // Query gemini-cli.
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-        let session_clone = session.clone();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            let _g = _guards;
-            let mut sess = session_clone.lock().await;
-            if combined_files.is_empty() {
-                if let Err(e) = sess.query(&combined_text, tx, cancel_clone).await {
-                    error!("Session query error: {e}");
-                }
-            } else {
-                if let Err(e) = sess
-                    .query_with_files(&combined_text, &combined_files, tx, cancel_clone)
-                    .await
-                {
-                    error!("Session query error: {e}");
-                }
+        let Some(request) = maybe_request else {
+            // No more queued work: remove entry if it is still idle.
+            let should_remove = {
+                let queue = queue_arc.lock().await;
+                !queue.running && queue.pending.is_empty()
+            };
+            if should_remove {
+                query_registry.remove(&key);
             }
-        });
+            return;
+        };
 
-        // Stream the response to the user.
-        if let Err(e) =
-            stream_response_with_drafts(&bot, &msg, &config, rx, cancel, cancel_registry).await
-        {
-            error!("Stream response error: {e}");
+        run_query_job(
+            &bot,
+            &config,
+            &sessions,
+            key,
+            request,
+            cancel_registry.clone(),
+        )
+        .await;
+    }
+}
+
+/// Execute one query against the agent and stream its output.
+async fn run_query_job(
+    bot: &Bot,
+    config: &Arc<Config>,
+    sessions: &Arc<SessionManager>,
+    key: SessionKey,
+    request: QueuedRequest,
+    cancel_registry: CancelRegistry,
+) {
+    let mut startup_placeholder_id = None;
+    if !sessions.has_session(&key) {
+        let mut req = bot
+            .send_message(request.msg.chat.id, "⏳ Подключаю Gemini-сессию…")
+            .disable_notification(true);
+        if let Some(tid) = request.msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if let Ok(sent) = req.await {
+            startup_placeholder_id = Some(sent.id);
+        }
+    }
+
+    let (session, _is_new) = match sessions.get_or_create(key).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to create session: {e}");
+            let err_msg = format!(
+                "❌ Не удалось запустить gemini-cli ACP сессию.\n\
+                 Проверь `GEMINI_CLI_COMMAND` (или `GEMINI_CLI_PATH`) в конфиге.\n\
+                 Error: {e}"
+            );
+            if let Some(pid) = startup_placeholder_id {
+                bot.edit_message_text(request.msg.chat.id, pid, err_msg)
+                    .await
+                    .ok();
+            } else {
+                let mut req = bot.send_message(request.msg.chat.id, err_msg);
+                if let Some(tid) = request.msg.thread_id {
+                    req = req.message_thread_id(tid);
+                }
+                req.await.ok();
+            }
+            return;
+        }
+    };
+
+    let title_data = sessions.record_user_message_for_thread_title(&key, &request.text);
+    maybe_rename_thread_title(
+        bot,
+        &request.msg,
+        &title_data.context_snippet,
+        title_data.total_messages,
+        config.thread_rename_every,
+    )
+    .await;
+
+    let cancel = CancellationToken::new();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let session_clone = session.clone();
+    let text = request.text.clone();
+    let files = request.files.clone();
+    let guards = request.guards;
+    let cancel_clone = cancel.clone();
+
+    let query_handle = tokio::spawn(async move {
+        let _guards = guards;
+        let mut sess = session_clone.lock().await;
+        let result = if files.is_empty() {
+            sess.query(&text, tx, cancel_clone).await
+        } else {
+            sess.query_with_files(&text, &files, tx, cancel_clone).await
+        };
+        if let Err(e) = result {
+            error!("Session query error: {e}");
         }
     });
+
+    if let Err(e) = stream_response_with_drafts(
+        bot,
+        &request.msg,
+        config,
+        rx,
+        startup_placeholder_id,
+        cancel,
+        cancel_registry.clone(),
+    )
+    .await
+    {
+        error!("Stream response error: {e}");
+    }
+
+    if let Err(e) = query_handle.await {
+        error!("Query task join error: {e}");
+    }
 }
 
 /// Stream the gemini-cli response to the user, handling file attachments.
@@ -137,81 +330,139 @@ pub fn spawn_drain_task(
 pub async fn stream_response_with_drafts(
     bot: &Bot,
     msg: &Message,
-    _config: &Config,
+    config: &Config,
     mut rx: tokio::sync::mpsc::Receiver<String>,
+    initial_placeholder_id: Option<teloxide::types::MessageId>,
     cancel: CancellationToken,
     cancel_registry: CancelRegistry,
 ) -> Result<()> {
+    let draft_mode = config.draft_mode;
     let mut accumulated = String::new();
+    let mut activity_log: Vec<String> = Vec::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
     let mut last_line = String::new();
+    let mut waiting_phase: usize = 0;
+    let mut last_draft = String::new();
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
+    const WAITING_TICK_INTERVAL: Duration = Duration::from_secs(2);
+
     // Show typing indicator immediately.
     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
         .await
         .ok();
 
-    // Send instant placeholder with a "Stop" inline button.
-    let mut placeholder_id: Option<teloxide::types::MessageId> = None;
-    let mut callback_key = String::new();
-    {
-        let mut req = bot.send_message(msg.chat.id, "⏳");
+    // Send placeholder (or reuse startup placeholder) with a "Stop" inline button.
+    let mut placeholder_id = initial_placeholder_id;
+
+    if let Some(pid) = placeholder_id {
+        if bot
+            .edit_message_text(msg.chat.id, pid, "⏳ Думаю…")
+            .await
+            .is_err()
+        {
+            placeholder_id = None;
+        }
+    }
+
+    if placeholder_id.is_none() {
+        let mut req = bot.send_message(msg.chat.id, "⏳ Думаю…");
         if let Some(tid) = msg.thread_id {
             req = req.message_thread_id(tid);
         }
         if let Ok(sent) = req.disable_notification(true).await {
             placeholder_id = Some(sent.id);
-            // Build callback key and register the cancellation token.
-            callback_key = format!("stop:{}:{}", msg.chat.id.0, sent.id.0);
-            cancel_registry.insert(callback_key.clone(), cancel.clone());
-            // Attach inline keyboard with the Stop button.
-            let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-                "🛑 Stop",
-                &callback_key,
-            )]]);
-            bot.edit_message_reply_markup(msg.chat.id, sent.id)
-                .reply_markup(kb)
-                .await
-                .ok();
         }
     }
 
+    let mut callback_key = String::new();
+    if let Some(pid) = placeholder_id {
+        callback_key = format!("stop:{}:{}", msg.chat.id.0, pid.0);
+        cancel_registry.insert(callback_key.clone(), cancel.clone());
+        let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+            "🛑 Stop",
+            &callback_key,
+        )]]);
+        bot.edit_message_reply_markup(msg.chat.id, pid)
+            .reply_markup(kb)
+            .await
+            .ok();
+    }
+
     let mut was_cancelled = false;
+    let mut waiting_tick = tokio::time::interval(WAITING_TICK_INTERVAL);
+    waiting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    waiting_tick.tick().await;
 
     loop {
         tokio::select! {
             line = rx.recv() => {
                 let Some(line) = line else { break };
 
-                // Intercept file attachments.
-                if line.starts_with("ATTACH_FILE:") {
-                    let path_str = line.trim_start_matches("ATTACH_FILE:").trim();
-                    let path = Path::new(path_str);
-                    if path.exists() {
-                        let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
-                        if let Some(tid) = msg.thread_id {
-                            req = req.message_thread_id(tid);
-                        }
-                        if let Err(e) = req.await {
-                            error!("Failed to send document: {e}");
-                        }
+                if let Some(event) = parse_stream_event(&line) {
+                    apply_stream_event(&mut activity_log, event);
+
+                    if last_update.elapsed() >= UPDATE_INTERVAL {
+                        render_placeholder_draft(
+                            bot,
+                            msg,
+                            placeholder_id,
+                            &accumulated,
+                            &activity_log,
+                            waiting_phase,
+                            draft_mode,
+                            &mut last_draft,
+                        )
+                        .await;
+                        last_update = Instant::now();
                     }
                     continue;
                 }
 
-                // Skip consecutive duplicate non-empty lines.
-                if line == last_line && !line.is_empty() {
+                // Intercept file attachments — check each line within
+                // the chunk since ACP doesn't emit line-delimited chunks.
+                let mut has_file = false;
+                let mut text_parts = Vec::new();
+                for sub_line in line.split('\n') {
+                    if sub_line.starts_with("ATTACH_FILE:") {
+                        has_file = true;
+                        let path_str = sub_line.trim_start_matches("ATTACH_FILE:").trim();
+                        let path = Path::new(path_str);
+                        if path.exists() {
+                            let mut req = bot.send_document(msg.chat.id, InputFile::file(path));
+                            if let Some(tid) = msg.thread_id {
+                                req = req.message_thread_id(tid);
+                            }
+                            if let Err(e) = req.await {
+                                error!("Failed to send document: {e}");
+                            }
+                        }
+                    } else {
+                        text_parts.push(sub_line);
+                    }
+                }
+
+                // Reconstruct non-attachment text.
+                let clean_text = if has_file {
+                    text_parts.join("\n")
+                } else {
+                    line.clone()
+                };
+
+                if clean_text.is_empty() {
                     continue;
                 }
-                last_line = line.clone();
 
-                // Accumulate.
-                if !accumulated.is_empty() {
-                    accumulated.push('\n');
+                // Skip consecutive duplicate non-empty chunks.
+                if clean_text == last_line && !clean_text.is_empty() {
+                    continue;
                 }
-                accumulated.push_str(&line);
+                last_line = clean_text.clone();
+
+                // Accumulate — ACP chunks already include proper
+                // whitespace/newlines, so we concatenate directly.
+                accumulated.push_str(&clean_text);
 
                 // Refresh typing indicator periodically.
                 if last_typing.elapsed() >= TYPING_INTERVAL {
@@ -222,12 +473,43 @@ pub async fn stream_response_with_drafts(
                 }
 
                 // Stream updates by editing the placeholder message.
-                if last_update.elapsed() >= UPDATE_INTERVAL && !accumulated.is_empty() {
-                    if let Some(pid) = placeholder_id {
-                        bot.edit_message_text(msg.chat.id, pid, &truncate_text(&accumulated))
-                            .await
-                            .ok();
-                    }
+                if last_update.elapsed() >= UPDATE_INTERVAL {
+                    render_placeholder_draft(
+                        bot,
+                        msg,
+                        placeholder_id,
+                        &accumulated,
+                        &activity_log,
+                        waiting_phase,
+                        draft_mode,
+                        &mut last_draft,
+                    )
+                    .await;
+                    last_update = Instant::now();
+                }
+            }
+            _ = waiting_tick.tick() => {
+                waiting_phase = waiting_phase.wrapping_add(1);
+
+                if last_typing.elapsed() >= TYPING_INTERVAL {
+                    bot.send_chat_action(msg.chat.id, ChatAction::Typing)
+                        .await
+                        .ok();
+                    last_typing = Instant::now();
+                }
+
+                if accumulated.trim().is_empty() || !activity_log.is_empty() {
+                    render_placeholder_draft(
+                        bot,
+                        msg,
+                        placeholder_id,
+                        &accumulated,
+                        &activity_log,
+                        waiting_phase,
+                        draft_mode,
+                        &mut last_draft,
+                    )
+                    .await;
                     last_update = Instant::now();
                 }
             }
@@ -250,7 +532,7 @@ pub async fn stream_response_with_drafts(
 
     // Build suffix for cancelled messages.
     let cancel_suffix = if was_cancelled {
-        "\n\n⬛ Generation stopped"
+        "\n\n⬛ Генерация остановлена"
     } else {
         ""
     };
@@ -258,9 +540,11 @@ pub async fn stream_response_with_drafts(
     // Final commit.
     if accumulated.is_empty() {
         let empty_msg = if was_cancelled {
-            "⬛ Generation stopped"
+            "⬛ Генерация остановлена"
+        } else if !activity_log.is_empty() {
+            "🧠 Ход работы получен, но текстовый ответ не пришел."
         } else {
-            "_(no response)_"
+            "_(нет ответа)_"
         };
         if let Some(pid) = placeholder_id {
             bot.edit_message_text(msg.chat.id, pid, empty_msg)
@@ -274,12 +558,27 @@ pub async fn stream_response_with_drafts(
         "{}{}",
         markdown_to_telegram_html(&accumulated),
         if was_cancelled {
-            "\n\n⬛ <i>Generation stopped</i>"
+            "\n\n⬛ <i>Генерация остановлена</i>"
         } else {
             ""
         }
     );
     let chunks = split_text(&html);
+
+    // In verbose mode we keep progress in a separate message and leave
+    // the final answer clean.
+    if draft_mode == DraftMode::Verbose && !activity_log.is_empty() {
+        let progress_text = format_progress_message(&activity_log, 8);
+        if let Some(pid) = placeholder_id {
+            bot.edit_message_text(msg.chat.id, pid, truncate_text(&progress_text))
+                .await
+                .ok();
+        } else {
+            send_plain_message(bot, msg, &progress_text, true).await;
+        }
+        send_html_chunks(bot, msg, &chunks).await;
+        return Ok(());
+    }
 
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 0 {
@@ -333,6 +632,256 @@ pub async fn stream_response_with_drafts(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamEventPayload {
+    kind: String,
+    status: Option<String>,
+    text: Option<String>,
+}
+
+fn parse_stream_event(chunk: &str) -> Option<StreamEventPayload> {
+    let payload = chunk.strip_prefix(STREAM_EVENT_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+fn apply_stream_event(activity_log: &mut Vec<String>, event: StreamEventPayload) {
+    match event.kind.as_str() {
+        "tool" => {
+            let icon = match event.status.as_deref() {
+                Some("completed") => "✅",
+                Some("pending") => "🔧",
+                _ => "🛠",
+            };
+            if let Some(text) = event.text {
+                push_activity(activity_log, format!("{icon} {}", compact_line(&text)));
+            }
+        }
+        "plan" => {
+            let icon = match event.status.as_deref() {
+                Some("completed") => "✅",
+                Some("in_progress") => "🔄",
+                _ => "📋",
+            };
+            if let Some(text) = event.text {
+                push_activity(activity_log, format!("{icon} {}", compact_line(&text)));
+            }
+        }
+        "error" => {
+            if let Some(text) = event.text {
+                push_activity(activity_log, format!("⚠️ {}", compact_line(&text)));
+            }
+        }
+        "usage" => {}
+        _ => {}
+    }
+}
+
+fn push_activity(activity_log: &mut Vec<String>, line: String) {
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        return;
+    }
+    if activity_log.last().is_some_and(|last| last == &line) {
+        return;
+    }
+    activity_log.push(line);
+
+    const MAX_ACTIVITY: usize = 20;
+    if activity_log.len() > MAX_ACTIVITY {
+        let drop_count = activity_log.len() - MAX_ACTIVITY;
+        activity_log.drain(0..drop_count);
+    }
+}
+
+async fn render_placeholder_draft(
+    bot: &Bot,
+    msg: &Message,
+    placeholder_id: Option<teloxide::types::MessageId>,
+    accumulated: &str,
+    activity_log: &[String],
+    waiting_phase: usize,
+    draft_mode: DraftMode,
+    last_draft: &mut String,
+) {
+    let Some(pid) = placeholder_id else {
+        return;
+    };
+
+    let draft = build_draft_text(accumulated, activity_log, waiting_phase, draft_mode);
+    if draft == *last_draft {
+        return;
+    }
+
+    bot.edit_message_text(msg.chat.id, pid, draft.clone())
+        .await
+        .ok();
+    *last_draft = draft;
+}
+
+fn build_draft_text(
+    accumulated: &str,
+    activity_log: &[String],
+    waiting_phase: usize,
+    draft_mode: DraftMode,
+) -> String {
+    const WAITING_LABELS: [&str; 3] = ["⏳ Думаю…", "⏳ Собираю контекст…", "⏳ Все еще работаю…"];
+    let waiting_label = WAITING_LABELS[waiting_phase % WAITING_LABELS.len()];
+
+    match draft_mode {
+        DraftMode::Compact => {
+            let out = if accumulated.trim().is_empty() {
+                if let Some(last) = activity_log.last() {
+                    format!("{waiting_label}\n{last}")
+                } else {
+                    waiting_label.to_string()
+                }
+            } else {
+                tail_text(accumulated, 2800)
+            };
+            truncate_text(&out)
+        }
+        DraftMode::Verbose => {
+            let mut out = String::new();
+            if !activity_log.is_empty() {
+                out.push_str("🧠 Ход работы\n");
+                for line in recent_activity(activity_log, 4) {
+                    out.push_str("• ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+
+            if accumulated.trim().is_empty() {
+                out.push_str(waiting_label);
+            } else {
+                out.push_str(&tail_text(accumulated, 2800));
+            }
+
+            truncate_text(&out)
+        }
+    }
+}
+
+fn recent_activity(activity_log: &[String], count: usize) -> Vec<&str> {
+    let mut recent: Vec<&str> = activity_log
+        .iter()
+        .rev()
+        .take(count)
+        .map(String::as_str)
+        .collect();
+    recent.reverse();
+    recent
+}
+
+fn compact_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn tail_text(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+
+    let start_idx = total.saturating_sub(max_chars.saturating_sub(1));
+    let tail: String = text.chars().skip(start_idx).collect();
+    format!("…{tail}")
+}
+
+async fn maybe_rename_thread_title(
+    bot: &Bot,
+    msg: &Message,
+    context_snippet: &str,
+    total_messages: usize,
+    rename_every: usize,
+) {
+    if total_messages == 0 {
+        return;
+    }
+
+    let should_rename =
+        total_messages == 1 || (rename_every > 0 && total_messages.is_multiple_of(rename_every));
+    if !should_rename {
+        return;
+    }
+
+    let Some(thread_id) = msg.thread_id else {
+        return;
+    };
+
+    let title = make_thread_title(context_snippet, total_messages);
+    bot.edit_forum_topic(msg.chat.id, thread_id)
+        .name(title)
+        .await
+        .ok();
+}
+
+fn make_thread_title(context_snippet: &str, total_messages: usize) -> String {
+    let summary = compact_line(context_snippet);
+    let summary = if summary.is_empty() {
+        "Сессия".to_string()
+    } else {
+        summary
+    };
+
+    let summary: String = summary.chars().take(96).collect();
+    let mut title = if total_messages <= 1 {
+        summary
+    } else {
+        format!("{summary} · #{total_messages}")
+    };
+    if title.chars().count() > 128 {
+        title = title.chars().take(128).collect();
+    }
+    if title.trim().is_empty() {
+        "Сессия".to_string()
+    } else {
+        title
+    }
+}
+
+fn format_progress_message(activity_log: &[String], count: usize) -> String {
+    let mut out = String::from("🧠 Ход работы\n");
+    for line in recent_activity(activity_log, count) {
+        out.push_str("• ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+async fn send_plain_message(bot: &Bot, msg: &Message, text: &str, disable_notification: bool) {
+    for chunk in split_text(text) {
+        let mut req = bot.send_message(msg.chat.id, chunk);
+        if let Some(tid) = msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if disable_notification {
+            req = req.disable_notification(true);
+        }
+        req.await.ok();
+    }
+}
+
+async fn send_html_chunks(bot: &Bot, msg: &Message, chunks: &[String]) {
+    for chunk in chunks {
+        let mut req = bot
+            .send_message(msg.chat.id, chunk)
+            .parse_mode(ParseMode::Html);
+        if let Some(tid) = msg.thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if req.await.is_err() {
+            let mut plain_req = bot.send_message(msg.chat.id, chunk);
+            if let Some(tid) = msg.thread_id {
+                plain_req = plain_req.message_thread_id(tid);
+            }
+            plain_req.await.ok();
+        }
+    }
+}
+
 /// Handle the "Stop" inline button callback.
 pub async fn handle_stop_callback(
     bot: Bot,
@@ -348,7 +897,7 @@ pub async fn handle_stop_callback(
     }
     // Acknowledge the callback to dismiss the spinner on the button.
     bot.answer_callback_query(&q.id)
-        .text("🛑 Stopped")
+        .text("🛑 Остановлено")
         .await
         .ok();
     Ok(())

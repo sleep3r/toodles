@@ -1,0 +1,11 @@
+bot_token = "123456:ABC-DEF..."
+
+# Optional allowlist
+# allowed_user_ids = [123456789, 987654321]
+
+gemini_cli_command = "gemini --acp"
+# gemini_cli_path = "gemini"
+# gemini_working_dir = "/Users/alexander/Desktop/stuff/toodles"
+gemini_yolo = true
+draft_mode = "verbose"
+thread_rename_every = 4

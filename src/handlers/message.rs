@@ -8,7 +8,7 @@ use crate::aggregator::{MessageAggregator, MessagePart};
 use crate::config::Config;
 use crate::session::SessionManager;
 
-use super::{session_key, CancelRegistry};
+use super::{session_key, CancelRegistry, QueryRegistry};
 
 /// Handle a plain text message: aggregate with nearby messages, then forward
 /// to the user's gemini-cli session and stream the response back.
@@ -19,6 +19,7 @@ pub async fn handle_text(
     sessions: Arc<SessionManager>,
     aggregator: Arc<MessageAggregator>,
     cancel_registry: CancelRegistry,
+    query_registry: QueryRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0,
@@ -46,7 +47,16 @@ pub async fn handle_text(
     );
 
     if is_first {
-        super::spawn_drain_task(bot, msg, config, sessions, aggregator, key, cancel_registry);
+        super::spawn_drain_task(
+            bot,
+            msg,
+            config,
+            sessions,
+            aggregator,
+            key,
+            cancel_registry,
+            query_registry,
+        );
     }
 
     Ok(())

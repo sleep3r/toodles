@@ -4,6 +4,18 @@
 
 .PHONY: build release run setup test clean check fmt lint help
 
+# Some macOS setups with Command Line Tools only miss Rust's default
+# clang runtime search path. Detect clang's resource dir and inject
+# LIBRARY_PATH so linker can find libclang_rt.osx.
+CLANG_RESOURCE_DIR := $(shell xcrun --toolchain default clang --print-resource-dir 2>/dev/null)
+CLANG_RT_DARWIN := $(CLANG_RESOURCE_DIR)/lib/darwin
+
+ifneq (,$(wildcard $(CLANG_RT_DARWIN)))
+  CARGO_ENV = LIBRARY_PATH="$(CLANG_RT_DARWIN)"
+else
+  CARGO_ENV =
+endif
+
 # Default target
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -14,23 +26,23 @@ help: ## Show this help
 # ──────────────────────────────────────────────────────────────────────────────
 
 build: ## Build debug binary
-	cargo build
+	$(CARGO_ENV) cargo build
 
 release: ## Build release binary
-	cargo build --release
+	$(CARGO_ENV) cargo build --release
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Run
 # ──────────────────────────────────────────────────────────────────────────────
 
 run: ## Run the bot (debug)
-	cargo run
+	$(CARGO_ENV) cargo run
 
 run-release: ## Run the bot (release)
-	cargo run --release
+	$(CARGO_ENV) cargo run --release
 
 setup: ## Run interactive setup wizard
-	cargo run -- --setup
+	$(CARGO_ENV) cargo run -- --setup
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Quality
@@ -40,7 +52,7 @@ check: ## Check compilation without building
 	cargo check
 
 test: ## Run tests
-	cargo test
+	$(CARGO_ENV) cargo test
 
 fmt: ## Format code
 	cargo fmt

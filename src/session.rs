@@ -1,86 +1,123 @@
-use anyhow::{Context, Result};
-use dashmap::DashMap;
-use std::process::Stdio;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
-use tokio::process::Command;
+use std::time::Duration;
+
+use anyhow::Result;
+use dashmap::DashMap;
+use serde_json::json;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
+use crate::acp::{AcpConnection, AcpEvent, ContentBlock};
 use crate::config::Config;
 
 /// Session key: `(chat_id, thread_id)`.
 /// `thread_id` is `Some` when the message belongs to a Telegram forum topic.
 pub type SessionKey = (i64, Option<i32>);
 
+/// Internal prefix for structured stream events sent over the text channel.
+///
+/// `stream_response_with_drafts` consumes these events to render nicer draft UX
+/// (tool/progress/waiting) without polluting the final assistant text.
+pub const STREAM_EVENT_PREFIX: &str = "__TOODLES_EVT__:";
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Session
+// ACP Session
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// A gemini-cli session that uses headless mode (`-p`) with `--resume` for
-/// multi-turn context.
+/// A gemini-cli session that uses ACP mode for persistent, low-latency
+/// communication.
 ///
-/// Each query spawns a fresh gemini-cli process in non-interactive mode.
-/// gemini-cli internally saves session state, and `--resume latest` restores
-/// the conversation history for continuity.
+/// The configured ACP agent process is spawned once and kept alive for
+/// the lifetime of the session. Prompts are sent via JSON-RPC over stdin/stdout.
 pub struct Session {
-    gemini_cli_path: String,
-    working_dir: Option<String>,
-    /// First query doesn't use `--resume`; subsequent ones do.
-    has_history: bool,
+    /// The ACP connection to the agent process.
+    conn: Arc<AcpConnection>,
+    /// The ACP session ID returned by `session/new`.
+    session_id: String,
+    /// Receiver for ACP events (text chunks, tool calls, etc.).
+    event_rx: mpsc::UnboundedReceiver<AcpEvent>,
     /// Whether to use --yolo (auto-approve all actions).
+    #[allow(dead_code)]
     yolo: bool,
     /// System prompt prepended to the first query.
     system_prompt: Option<String>,
+    /// Whether we've sent the first prompt (system prompt is prepended on first).
+    has_history: bool,
 }
 
 impl Session {
-    pub fn new(
-        gemini_cli_path: &str,
+    /// Create a new ACP session by spawning the configured agent command.
+    pub async fn new(
+        agent_cmd: &str,
         working_dir: Option<&str>,
         yolo: bool,
         system_prompt: Option<String>,
-    ) -> Self {
-        info!("Created new headless session");
-        Self {
-            gemini_cli_path: gemini_cli_path.to_string(),
-            working_dir: working_dir.map(|s| s.to_string()),
-            has_history: false,
+    ) -> Result<Self> {
+        let dir = working_dir.map(Path::new);
+        let (conn, event_rx) = AcpConnection::spawn(agent_cmd, dir).await?;
+
+        // Initialize the ACP connection.
+        let init_result = conn.initialize().await?;
+        info!("ACP initialized: {:?}", init_result.get("agentInfo"));
+
+        // Create a new session.
+        let cwd = dir
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let session_id = conn.new_session(&cwd).await?;
+
+        // Auto-set yolo mode if requested (auto-approve all tool calls).
+        if yolo {
+            match conn.set_session_mode(&session_id, "yolo").await {
+                Ok(_) => info!("ACP session mode set to yolo"),
+                Err(e) => warn!("Failed to set yolo mode (will use default): {e}"),
+            }
+        }
+
+        Ok(Self {
+            conn: Arc::new(conn),
+            session_id,
+            event_rx,
             yolo,
             system_prompt,
-        }
+            has_history: false,
+        })
     }
 
-    /// Send a prompt and stream the response line-by-line.
+    /// Send a prompt and stream the response via the provided channel.
     ///
-    /// Uses `gemini -p "prompt" -o text --sandbox=false [--yolo] [--resume latest]`.
+    /// Text chunks from ACP events are forwarded to `tx`, matching the
+    /// interface expected by `stream_response_with_drafts`.
+    ///
+    /// If the `cancel` token is triggered, the ACP cancel notification is sent.
     pub async fn query(
         &mut self,
         prompt: &str,
-        tx: tokio::sync::mpsc::Sender<String>,
+        tx: mpsc::Sender<String>,
         cancel: CancellationToken,
     ) -> Result<()> {
         self.query_with_files(prompt, &[], tx, cancel).await
     }
 
-    /// Send a prompt with optional file attachments and stream the response line-by-line.
+    /// Send a prompt with optional file attachments and stream the response.
     ///
-    /// Files are passed as positional arguments to gemini-cli so it uploads them
-    /// via the Gemini API as multimodal parts.
-    ///
-    /// If the `cancel` token is triggered, the gemini-cli process is killed and
-    /// the method returns early.
+    /// Files are referenced using gemini-cli's `@{path}` syntax in the prompt
+    /// text, which gemini-cli processes in ACP mode.
     pub async fn query_with_files(
         &mut self,
         prompt: &str,
         file_paths: &[String],
-        tx: tokio::sync::mpsc::Sender<String>,
+        tx: mpsc::Sender<String>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        debug!("Query: {}", &prompt[..prompt.len().min(80)]);
+        debug!("ACP query: {}", &prompt[..prompt.len().min(80)]);
 
-        // Prepend system prompt on the first query of a new session.
+        // Prepend system prompt on the first query.
         let mut full_prompt = if !self.has_history {
             if let Some(ref sp) = self.system_prompt {
                 format!("[System instruction]: {}\n\n{}", sp, prompt)
@@ -91,7 +128,7 @@ impl Session {
             prompt.to_string()
         };
 
-        // Use native @{path} syntax for multimodal file injection.
+        // Append file references using @{path} syntax.
         if !file_paths.is_empty() {
             full_prompt.push_str("\n\n");
             for path in file_paths {
@@ -99,138 +136,155 @@ impl Session {
             }
         }
 
-        let mut cmd = Command::new(&self.gemini_cli_path);
-        cmd.arg("-p")
-            .arg(&full_prompt)
-            .arg("-o")
-            .arg("text")
-            .arg("--sandbox=false")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        // Send the prompt via ACP.
+        let content = vec![ContentBlock::Text(full_prompt)];
+        let conn = self.conn.clone();
+        let session_id = self.session_id.clone();
 
-        if self.yolo {
-            cmd.arg("--yolo");
-        }
+        let prompt_fut = conn.prompt(&session_id, content);
+        tokio::pin!(prompt_fut);
 
-        if self.has_history {
-            cmd.arg("--resume").arg("latest");
-        }
-
-        // Allow gemini-cli to read directories containing attached files.
-        if !file_paths.is_empty() {
-            let mut dirs: Vec<String> = file_paths
-                .iter()
-                .filter_map(|p| {
-                    std::path::Path::new(p)
-                        .parent()
-                        .map(|d| d.to_string_lossy().to_string())
-                })
-                .collect();
-            dirs.sort();
-            dirs.dedup();
-            cmd.arg("--include-directories").arg(dirs.join(","));
-        }
-
-        if let Some(ref dir) = self.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn '{}'", self.gemini_cli_path))?;
-
-        // Stream stdout line-by-line as gemini-cli produces output.
-        let stdout = child
-            .stdout
-            .take()
-            .context("Failed to capture gemini-cli stdout")?;
-
-        // Spawn a task to log stderr in the background.
-        let stderr = child.stderr.take();
-        let stderr_task = tokio::spawn(async move {
-            if let Some(err_stream) = stderr {
-                let mut err_reader = tokio::io::BufReader::new(err_stream);
-                let mut err_line = String::new();
-                loop {
-                    err_line.clear();
-                    match err_reader.read_line(&mut err_line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = err_line.trim();
-                            if !trimmed.is_empty() {
-                                debug!("gemini-cli stderr: {}", trimmed);
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        });
-
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut line_buf = String::new();
+        let mut prompt_done = false;
         let mut cancelled = false;
 
         loop {
-            line_buf.clear();
             tokio::select! {
-                result = reader.read_line(&mut line_buf) => {
+                result = &mut prompt_fut, if !prompt_done => {
+                    prompt_done = true;
                     match result {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            let stripped = strip_ansi(line_buf.trim_end_matches('\n'));
-                            let _ = tx.send(stripped).await;
+                        Ok(result) => {
+                            let stop_reason = result["stopReason"].as_str().unwrap_or("unknown");
+                            debug!("ACP prompt finished: stopReason={stop_reason}");
+                            if stop_reason == "cancelled" {
+                                cancelled = true;
+                            }
                         }
                         Err(e) => {
-                            error!("Error reading gemini-cli stdout: {e}");
+                            error!("ACP prompt error: {e}");
+                            let _ = tx.send(format!("\n⚠️ ACP error: {e}")).await;
+                        }
+                    }
+                }
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => forward_event(&tx, event).await,
+                        None => {
+                            error!("ACP event channel closed unexpectedly");
                             break;
                         }
                     }
                 }
-                _ = cancel.cancelled() => {
-                    info!("Generation cancelled by user — killing gemini-cli");
-                    let _ = child.kill().await;
+                _ = cancel.cancelled(), if !cancelled => {
+                    info!("Cancelling ACP prompt");
                     cancelled = true;
-                    break;
+                    if let Err(e) = conn.cancel(&session_id).await {
+                        warn!("Failed to send ACP cancel: {e}");
+                    }
                 }
             }
-        }
 
-        if !cancelled {
-            // Wait for the process to exit with a generous timeout to allow
-            // for tool-use operations (e.g. creating Google Docs via gws).
-            match tokio::time::timeout(std::time::Duration::from_secs(300), child.wait()).await {
-                Ok(Ok(status)) if !status.success() => {
-                    error!("gemini-cli exited with {}", status);
-                    let _ = tx
-                        .send(format!("\n⚠️ gemini-cli завершился с ошибкой ({})", status))
-                        .await;
+            if prompt_done {
+                // Drain any remaining buffered events.
+                while let Ok(event) = self.event_rx.try_recv() {
+                    forward_event(&tx, event).await;
                 }
-                Ok(Err(e)) => {
-                    error!("Failed to wait for gemini-cli: {e}");
-                    let _ = tx.send(format!("\n⚠️ Ошибка gemini-cli: {e}")).await;
-                }
-                Err(_) => {
-                    error!("gemini-cli timed out after 300s! Killing process.");
-                    let _ = child.kill().await;
-                    let _ = tx
-                        .send(
-                            "\n⚠️ gemini-cli не ответил (таймаут 5 минут). Попробуйте снова."
-                                .to_string(),
-                        )
-                        .await;
-                }
-                _ => {}
+                break;
             }
         }
-
-        // Let stderr drain.
-        stderr_task.await.ok();
 
         self.has_history = true;
         Ok(())
+    }
+}
+
+/// Forward an ACP event to the text channel used by streaming display.
+async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
+    match event {
+        AcpEvent::TextChunk(text) => {
+            // Send raw text chunk — no newline added, ACP chunks include
+            // their own whitespace/newlines.
+            let _ = tx.send(text).await;
+        }
+        AcpEvent::ToolCall {
+            title,
+            kind: _,
+            id: _,
+            status,
+        } => {
+            if status == "pending" {
+                emit_stream_event(tx, "tool", Some("pending"), Some(&title)).await;
+            }
+        }
+        AcpEvent::ToolCallUpdate {
+            id: _,
+            status,
+            content,
+        } => {
+            if status == "completed" {
+                let text = content
+                    .as_deref()
+                    .map(|t| truncate(t, 200))
+                    .unwrap_or_else(|| "completed".to_string());
+                emit_stream_event(tx, "tool", Some("completed"), Some(&text)).await;
+            }
+        }
+        AcpEvent::Plan(entries) => {
+            for entry in entries {
+                emit_stream_event(
+                    tx,
+                    "plan",
+                    Some(entry.status.as_str()),
+                    Some(entry.content.as_str()),
+                )
+                .await;
+            }
+        }
+        AcpEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            emit_stream_event(
+                tx,
+                "usage",
+                None,
+                Some(&format!(
+                    "input={} output={}",
+                    input_tokens.unwrap_or(0),
+                    output_tokens.unwrap_or(0)
+                )),
+            )
+            .await;
+        }
+        AcpEvent::Finished => {
+            // No-op, the prompt response handles completion.
+        }
+        AcpEvent::Error(e) => {
+            emit_stream_event(tx, "error", None, Some(e.as_str())).await;
+        }
+    }
+}
+
+async fn emit_stream_event(
+    tx: &mpsc::Sender<String>,
+    kind: &str,
+    status: Option<&str>,
+    text: Option<&str>,
+) {
+    let payload = json!({
+        "kind": kind,
+        "status": status,
+        "text": text,
+    });
+    let _ = tx.send(format!("{STREAM_EVENT_PREFIX}{payload}")).await;
+}
+
+/// Truncate a string to a maximum length, adding "…" if truncated.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -260,52 +314,198 @@ pub fn strip_ansi(s: &str) -> String {
 // SessionManager
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Thread-safe registry of active gemini-cli sessions.
+/// Thread-safe registry of active ACP sessions.
 pub struct SessionManager {
     sessions: DashMap<SessionKey, Arc<Mutex<Session>>>,
+    message_counters: DashMap<SessionKey, usize>,
+    recent_user_messages: DashMap<SessionKey, VecDeque<String>>,
     config: Arc<Config>,
+}
+
+/// Data used to derive a forum topic title update.
+pub struct ThreadTitleData {
+    pub total_messages: usize,
+    pub context_snippet: String,
 }
 
 impl SessionManager {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             sessions: DashMap::new(),
+            message_counters: DashMap::new(),
+            recent_user_messages: DashMap::new(),
             config,
+        }
+    }
+
+    /// Returns whether an ACP session is already warm for this key.
+    pub fn has_session(&self, key: &SessionKey) -> bool {
+        self.sessions.contains_key(key)
+    }
+
+    /// Record one user message for thread naming and return naming context.
+    pub fn record_user_message_for_thread_title(
+        &self,
+        key: &SessionKey,
+        text: &str,
+    ) -> ThreadTitleData {
+        const MAX_STORED_MESSAGES: usize = 12;
+        const MAX_CONTEXT_MESSAGES: usize = 5;
+        const MAX_CONTEXT_CHARS: usize = 180;
+
+        let mut entry = self.message_counters.entry(*key).or_insert(0);
+        *entry += 1;
+        let total_messages = *entry;
+
+        let normalized = normalize_for_title(text);
+        if !normalized.is_empty() {
+            let mut history = self
+                .recent_user_messages
+                .entry(*key)
+                .or_insert_with(VecDeque::new);
+            history.push_back(normalized);
+            while history.len() > MAX_STORED_MESSAGES {
+                history.pop_front();
+            }
+        }
+
+        let context_snippet = self
+            .recent_user_messages
+            .get(key)
+            .map(|history| {
+                let mut selected: Vec<&str> = Vec::new();
+                let mut used_chars = 0usize;
+
+                for message in history.iter().rev() {
+                    if message.is_empty() {
+                        continue;
+                    }
+
+                    let message_chars = message.chars().count();
+                    let add_chars = if selected.is_empty() {
+                        message_chars
+                    } else {
+                        3 + message_chars // " · "
+                    };
+
+                    if used_chars + add_chars > MAX_CONTEXT_CHARS {
+                        break;
+                    }
+
+                    selected.push(message.as_str());
+                    used_chars += add_chars;
+
+                    if selected.len() >= MAX_CONTEXT_MESSAGES {
+                        break;
+                    }
+                }
+
+                selected.reverse();
+                selected.join(" · ")
+            })
+            .unwrap_or_default();
+
+        ThreadTitleData {
+            total_messages,
+            context_snippet,
         }
     }
 
     /// Get an existing session or create a new one.
     ///
     /// Returns `(session, is_new)` where `is_new` is `true` when a fresh
-    /// session was just created (caller should warm it up).
+    /// session was just created.
     pub async fn get_or_create(&self, key: SessionKey) -> Result<(Arc<Mutex<Session>>, bool)> {
         use dashmap::mapref::entry::Entry;
+
+        if let Some(existing) = self.sessions.get(&key) {
+            return Ok((existing.value().clone(), false));
+        }
+
+        let created = Arc::new(Mutex::new(self.create_session_with_retries(key).await?));
+
         match self.sessions.entry(key) {
             Entry::Occupied(e) => Ok((e.get().clone(), false)),
             Entry::Vacant(e) => {
-                info!("Creating new gemini-cli session for {:?}", key);
-                let session = Session::new(
-                    &self.config.gemini_cli_path,
-                    self.config.gemini_working_dir.as_deref(),
-                    true, // yolo mode
-                    self.config.system_prompt.clone(),
-                );
-                let session = Arc::new(Mutex::new(session));
-                e.insert(session.clone());
-                Ok((session, true))
+                e.insert(created.clone());
+                Ok((created, true))
             }
         }
     }
 
-    /// Reset a session – drop our `Session` and start fresh.
+    async fn create_session_with_retries(&self, key: SessionKey) -> Result<Session> {
+        const MAX_ATTEMPTS: usize = 3;
+        const BASE_RETRY_DELAY_MS: u64 = 600;
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            info!(
+                ?key,
+                attempt,
+                cmd = %self.config.gemini_cli_command,
+                "Creating ACP session"
+            );
+
+            match Session::new(
+                &self.config.gemini_cli_command,
+                self.config.gemini_working_dir.as_deref(),
+                self.config.gemini_yolo,
+                self.config.system_prompt.clone(),
+            )
+            .await
+            {
+                Ok(session) => {
+                    if attempt > 1 {
+                        info!(?key, attempt, "ACP session created after retry");
+                    }
+                    return Ok(session);
+                }
+                Err(e) => {
+                    warn!(?key, attempt, error = %e, "ACP session creation attempt failed");
+                    last_error = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        let delay = Duration::from_millis(BASE_RETRY_DELAY_MS * attempt as u64);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        match last_error {
+            Some(e) => Err(e.context(format!(
+                "Failed to create ACP session for gemini-cli after {MAX_ATTEMPTS} attempts"
+            ))),
+            None => Err(anyhow::anyhow!(
+                "Failed to create ACP session for gemini-cli"
+            )),
+        }
+    }
+
+    /// Reset a session – drop the ACP process and start fresh.
     pub async fn reset(&self, key: &SessionKey) {
         self.sessions.remove(key);
+        self.message_counters.remove(key);
+        self.recent_user_messages.remove(key);
         info!("Session {:?} reset", key);
     }
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
+}
+
+fn normalize_for_title(text: &str) -> String {
+    const MAX_SINGLE_MESSAGE_CHARS: usize = 96;
+
+    let compact = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    compact.chars().take(MAX_SINGLE_MESSAGE_CHARS).collect()
 }
 
 #[cfg(test)]
@@ -352,166 +552,5 @@ mod tests {
     #[test]
     fn strip_ansi_cursor_movement() {
         assert_eq!(strip_ansi("\x1b[2Ahello"), "hello");
-    }
-
-    // ── SessionManager ──────────────────────────────────────────────────
-
-    fn test_config() -> Arc<Config> {
-        Arc::new(Config {
-            telegram_bot_token: "test".to_string(),
-            allowed_user_ids: vec![],
-            gemini_cli_path: "echo".to_string(), // Use echo as a dummy
-            gemini_working_dir: None,
-            openai_api_key: None,
-            use_local_transcription: false,
-            models_dir: std::path::PathBuf::from("/tmp"),
-            system_prompt: Some("test prompt".to_string()),
-        })
-    }
-
-    #[tokio::test]
-    async fn session_manager_create_returns_new() {
-        let mgr = SessionManager::new(test_config());
-        let key: SessionKey = (100, None);
-        let (_session, is_new) = mgr.get_or_create(key).await.unwrap();
-        assert!(is_new);
-    }
-
-    #[tokio::test]
-    async fn session_manager_get_existing_returns_not_new() {
-        let mgr = SessionManager::new(test_config());
-        let key: SessionKey = (100, None);
-        mgr.get_or_create(key).await.unwrap();
-        let (_session, is_new) = mgr.get_or_create(key).await.unwrap();
-        assert!(!is_new);
-    }
-
-    #[tokio::test]
-    async fn session_manager_different_keys_are_separate() {
-        let mgr = SessionManager::new(test_config());
-        let key_a: SessionKey = (100, None);
-        let key_b: SessionKey = (200, None);
-
-        let (_, is_new_a) = mgr.get_or_create(key_a).await.unwrap();
-        let (_, is_new_b) = mgr.get_or_create(key_b).await.unwrap();
-
-        assert!(is_new_a);
-        assert!(is_new_b);
-        assert_eq!(mgr.session_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn session_manager_thread_id_isolates_sessions() {
-        let mgr = SessionManager::new(test_config());
-        let key_no_thread: SessionKey = (100, None);
-        let key_with_thread: SessionKey = (100, Some(42));
-
-        mgr.get_or_create(key_no_thread).await.unwrap();
-        mgr.get_or_create(key_with_thread).await.unwrap();
-
-        assert_eq!(mgr.session_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn session_manager_reset_removes_session() {
-        let mgr = SessionManager::new(test_config());
-        let key: SessionKey = (100, None);
-        mgr.get_or_create(key).await.unwrap();
-        assert_eq!(mgr.session_count(), 1);
-
-        mgr.reset(&key).await;
-        assert_eq!(mgr.session_count(), 0);
-
-        // Next get_or_create should be "new" again.
-        let (_, is_new) = mgr.get_or_create(key).await.unwrap();
-        assert!(is_new);
-    }
-
-    #[tokio::test]
-    async fn session_manager_session_count() {
-        let mgr = SessionManager::new(test_config());
-        assert_eq!(mgr.session_count(), 0);
-
-        mgr.get_or_create((1, None)).await.unwrap();
-        assert_eq!(mgr.session_count(), 1);
-
-        mgr.get_or_create((2, None)).await.unwrap();
-        assert_eq!(mgr.session_count(), 2);
-
-        mgr.get_or_create((1, None)).await.unwrap(); // existing
-        assert_eq!(mgr.session_count(), 2);
-    }
-
-    // ── Session query with CancellationToken ────────────────────────────
-
-    #[tokio::test]
-    async fn session_query_with_echo_produces_output() {
-        // Use `echo` as a dummy gemini-cli — it echoes the prompt to stdout.
-        let mut session = Session::new("echo", None, false, None);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        let cancel = CancellationToken::new();
-
-        session.query("hello world", tx, cancel).await.unwrap();
-
-        // echo writes "[System instruction]: ..." or just the prompt.
-        let mut lines = Vec::new();
-        while let Ok(line) = rx.try_recv() {
-            lines.push(line);
-        }
-        assert!(!lines.is_empty(), "echo should produce at least one line");
-    }
-
-    #[tokio::test]
-    async fn session_query_cancelled_before_start() {
-        let mut session = Session::new("sleep", None, false, None);
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
-        let cancel = CancellationToken::new();
-
-        // Cancel immediately before even running.
-        cancel.cancel();
-
-        // sleep 10 would normally block, but the cancel token should kill it.
-        // We use a timeout to ensure the test doesn't hang.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            session.query("10", tx, cancel),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "Query should complete quickly when cancelled"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_has_history_after_query() {
-        let mut session = Session::new("echo", None, false, None);
-        assert!(!session.has_history);
-
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
-        let cancel = CancellationToken::new();
-        session.query("test", tx, cancel).await.unwrap();
-
-        assert!(session.has_history);
-    }
-
-    #[tokio::test]
-    async fn session_system_prompt_prepended_on_first_query() {
-        let mut session = Session::new("echo", None, false, Some("Be helpful".to_string()));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-        let cancel = CancellationToken::new();
-
-        session.query("hello", tx, cancel).await.unwrap();
-
-        let mut full_output = String::new();
-        while let Ok(line) = rx.try_recv() {
-            full_output.push_str(&line);
-        }
-        // echo prints the full prompt including system instruction.
-        assert!(
-            full_output.contains("Be helpful"),
-            "System prompt should be in the first query"
-        );
     }
 }
