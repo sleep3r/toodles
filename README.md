@@ -47,6 +47,7 @@ A Telegram bot written in Rust that wraps [`gemini-cli`](https://github.com/goog
 | 🏷️ | **Thread auto-title** | First message sets topic title; later updates use recent-context summaries |
 | 🔄 | **Session management** | `/new` starts fresh, `/status` shows active count |
 | 🔒 | **Access control** | Optional user allowlist via `ALLOWED_USER_IDS` |
+| 🖥️ | **macOS background service** | launchd targets keep the bot running 24/7 with auto-restart |
 | 🧙 | **Setup wizard** | Interactive `--setup` generates `.env` with guided prompts |
 | 🎨 | **Customisable prompt** | System prompt configurable via `SYSTEM_PROMPT` in `.env` |
 | ✅ | **CI-gated** | `check + fmt + clippy + test` on every push/PR |
@@ -78,6 +79,43 @@ $EDITOR .env
 make run            # debug
 make release        # optimized build
 make run-release    # run optimized
+
+# Optional: install as macOS launchd service (24/7)
+make service-install
+```
+
+### Run as macOS background service (launchd)
+
+```sh
+make service-install   # build release + install + start
+make service-status    # check launchd state
+make service-logs      # tail bot logs
+```
+
+`service-install` copies your project `.env` into `~/.config/toodles/service.env`
+so launchd can read secrets consistently.
+
+After code changes:
+
+```sh
+make service-update    # rebuild release + restart service
+```
+
+If you change `.env`, run `make service-update` to sync it into the service env file.
+
+Stop / remove service:
+
+```sh
+make service-stop
+make service-uninstall
+```
+
+Optional overrides (passed as Make variables):
+
+```sh
+make LAUNCHD_LABEL=com.alex.toodles service-install
+make TOODLES_ENV_FILE=/path/to/.env service-install
+make LAUNCHD_WORKDIR=/Users/alexander service-install
 ```
 
 ## 💬 How It Works
@@ -248,6 +286,13 @@ make test          # run tests
 make lint          # clippy
 make fmt           # format code
 make clean         # clean artifacts
+make service-install   # install/start launchd service
+make service-sync-env  # copy .env into launchd service env
+make service-update    # rebuild + restart launchd service
+make service-stop      # stop launchd service
+make service-status    # print launchd status
+make service-logs      # tail service logs
+make service-uninstall # remove launchd service
 ```
 
 ## 📄 License

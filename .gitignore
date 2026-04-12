@@ -40,3 +40,4 @@ _agents/
 GEMINI.md
 .DS_Store
 brain/
+logs/
