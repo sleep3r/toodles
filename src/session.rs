@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -14,6 +14,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::acp::{AcpConnection, AcpEvent, ContentBlock};
 use crate::config::Config;
+
+const OUTPUT_POLICY: &str = "When creating a file for the user, save it to disk and output exactly one line: ATTACH_FILE:/absolute/path/to/file";
 
 /// Session key: `(chat_id, thread_id)`.
 /// `thread_id` is `Some` when the message belongs to a Telegram forum topic.
@@ -125,13 +127,15 @@ impl Session {
     ) -> Result<()> {
         debug!("ACP query: {}", &prompt[..prompt.len().min(80)]);
 
-        // Prepend system prompt on the first query.
+        // Prepend system prompt on the first query only.
         let mut full_prompt = if !self.has_history {
+            let mut system = String::new();
             if let Some(ref sp) = self.system_prompt {
-                format!("[System instruction]: {}\n\n{}", sp, prompt)
-            } else {
-                prompt.to_string()
+                system.push_str(sp);
+                system.push_str("\n\n");
             }
+            system.push_str(OUTPUT_POLICY);
+            format!("[System]: {}\n\n{}", system, prompt)
         } else {
             prompt.to_string()
         };
@@ -154,6 +158,19 @@ impl Session {
 
         let mut prompt_done = false;
         let mut cancelled = false;
+        let mut completed_ok = false;
+        let started_at = Instant::now();
+        let mut last_event_at = Instant::now();
+        let mut cancel_grace_deadline: Option<Instant> = None;
+        let mut abort_reason: Option<String> = None;
+
+        const MAX_PROMPT_RUNTIME: Duration = Duration::from_secs(20 * 60);
+        const NO_EVENT_SOFT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+        const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(12);
+
+        let mut watchdog_tick = tokio::time::interval(Duration::from_secs(2));
+        watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        watchdog_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -165,19 +182,26 @@ impl Session {
                             debug!("ACP prompt finished: stopReason={stop_reason}");
                             if stop_reason == "cancelled" {
                                 cancelled = true;
+                            } else {
+                                completed_ok = true;
                             }
                         }
                         Err(e) => {
                             error!("ACP prompt error: {e}");
                             let _ = tx.send(format!("\n⚠️ ACP error: {e}")).await;
+                            abort_reason = Some(format!("ACP prompt error: {e}"));
                         }
                     }
                 }
                 event = self.event_rx.recv() => {
                     match event {
-                        Some(event) => forward_event(&tx, event).await,
+                        Some(event) => {
+                            last_event_at = Instant::now();
+                            forward_event(&tx, event).await;
+                        }
                         None => {
                             error!("ACP event channel closed unexpectedly");
+                            abort_reason = Some("ACP event channel closed".to_string());
                             break;
                         }
                     }
@@ -185,8 +209,41 @@ impl Session {
                 _ = cancel.cancelled(), if !cancelled => {
                     info!("Cancelling ACP prompt");
                     cancelled = true;
+                    cancel_grace_deadline = Some(Instant::now() + CANCEL_GRACE_TIMEOUT);
                     if let Err(e) = conn.cancel(&session_id).await {
                         warn!("Failed to send ACP cancel: {e}");
+                    }
+                }
+                _ = watchdog_tick.tick() => {
+                    if prompt_done {
+                        continue;
+                    }
+
+                    if started_at.elapsed() >= MAX_PROMPT_RUNTIME {
+                        abort_reason = Some(format!(
+                            "Prompt runtime exceeded {}s",
+                            MAX_PROMPT_RUNTIME.as_secs()
+                        ));
+                        let _ = conn.cancel(&session_id).await;
+                        break;
+                    }
+
+                    if !cancelled && last_event_at.elapsed() >= NO_EVENT_SOFT_TIMEOUT {
+                        warn!(
+                            "No ACP events for {}s, forcing cancel",
+                            NO_EVENT_SOFT_TIMEOUT.as_secs()
+                        );
+                        cancelled = true;
+                        cancel_grace_deadline = Some(Instant::now() + CANCEL_GRACE_TIMEOUT);
+                        let _ = conn.cancel(&session_id).await;
+                    }
+
+                    if cancelled
+                        && cancel_grace_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        abort_reason = Some("Prompt cancel grace timeout exceeded".to_string());
+                        break;
                     }
                 }
             }
@@ -200,10 +257,21 @@ impl Session {
             }
         }
 
-        self.has_history = true;
+        if let Some(reason) = abort_reason {
+            let _ = tx
+                .send(format!("\n⚠️ Прервано: {reason}. Попробуй еще раз."))
+                .await;
+            return Err(anyhow::anyhow!(reason));
+        }
+
+        if completed_ok {
+            self.has_history = true;
+        }
         Ok(())
     }
 }
+
+
 
 /// Forward an ACP event to the text channel used by streaming display.
 async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
@@ -212,6 +280,9 @@ async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
             // Send raw text chunk — no newline added, ACP chunks include
             // their own whitespace/newlines.
             let _ = tx.send(text).await;
+        }
+        AcpEvent::ActivityTick => {
+            emit_stream_event(tx, "activity", None, None).await;
         }
         AcpEvent::ToolCall { title, status } => {
             if status == "pending" {

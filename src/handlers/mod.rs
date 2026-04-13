@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::Deserialize;
+
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ParseMode,
@@ -283,6 +284,8 @@ async fn run_query_job(
     let cancel = CancellationToken::new();
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let session_clone = session.clone();
+    let sessions_clone = sessions.clone();
+    let key_for_reset = key;
     let text = request.text.clone();
     let files = request.files.clone();
     let guards = request.guards;
@@ -298,6 +301,8 @@ async fn run_query_job(
         };
         if let Err(e) = result {
             error!("Session query error: {e}");
+            drop(sess);
+            sessions_clone.reset(&key_for_reset).await;
         }
     });
 
@@ -341,6 +346,7 @@ pub async fn stream_response_with_drafts(
     let mut activity_log: Vec<String> = Vec::new();
     let mut last_update = Instant::now();
     let mut last_typing = Instant::now();
+    let mut last_stream_event = Instant::now();
     let mut last_line = String::new();
     let mut waiting_phase: usize = 0;
     let mut last_draft = String::new();
@@ -349,6 +355,7 @@ pub async fn stream_response_with_drafts(
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
     const WAITING_TICK_INTERVAL: Duration = Duration::from_secs(2);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
     // Show typing indicator immediately.
     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
@@ -382,17 +389,14 @@ pub async fn stream_response_with_drafts(
     if let Some(pid) = placeholder_id {
         callback_key = format!("stop:{}:{}", msg.chat.id.0, pid.0);
         cancel_registry.insert(callback_key.clone(), cancel.clone());
-        let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-            "🛑 Stop",
-            &callback_key,
-        )]]);
         bot.edit_message_reply_markup(msg.chat.id, pid)
-            .reply_markup(kb)
+            .reply_markup(stop_inline_keyboard(&callback_key))
             .await
             .ok();
     }
 
     let mut was_cancelled = false;
+    let mut was_stalled = false;
     let mut waiting_tick = tokio::time::interval(WAITING_TICK_INTERVAL);
     waiting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     waiting_tick.tick().await;
@@ -401,6 +405,7 @@ pub async fn stream_response_with_drafts(
         tokio::select! {
             line = rx.recv() => {
                 let Some(line) = line else { break };
+                last_stream_event = Instant::now();
 
                 if let Some(event) = parse_stream_event(&line) {
                     apply_stream_event(&mut activity_log, event);
@@ -414,6 +419,11 @@ pub async fn stream_response_with_drafts(
                             &activity_log,
                             waiting_phase,
                             draft_mode,
+                            if callback_key.is_empty() {
+                                None
+                            } else {
+                                Some(callback_key.as_str())
+                            },
                             &mut last_draft,
                         )
                         .await;
@@ -464,6 +474,11 @@ pub async fn stream_response_with_drafts(
                         &activity_log,
                         waiting_phase,
                         draft_mode,
+                        if callback_key.is_empty() {
+                            None
+                        } else {
+                            Some(callback_key.as_str())
+                        },
                         &mut last_draft,
                     )
                     .await;
@@ -472,6 +487,16 @@ pub async fn stream_response_with_drafts(
             }
             _ = waiting_tick.tick() => {
                 waiting_phase = waiting_phase.wrapping_add(1);
+
+                if last_stream_event.elapsed() >= STALL_TIMEOUT
+                    && accumulated.trim().is_empty()
+                    && activity_log.is_empty()
+                {
+                    was_stalled = true;
+                    was_cancelled = true;
+                    cancel.cancel();
+                    break;
+                }
 
                 if last_typing.elapsed() >= TYPING_INTERVAL {
                     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
@@ -489,6 +514,11 @@ pub async fn stream_response_with_drafts(
                         &activity_log,
                         waiting_phase,
                         draft_mode,
+                        if callback_key.is_empty() {
+                            None
+                        } else {
+                            Some(callback_key.as_str())
+                        },
                         &mut last_draft,
                     )
                     .await;
@@ -533,7 +563,9 @@ pub async fn stream_response_with_drafts(
     }
 
     // Build suffix for cancelled messages.
-    let cancel_suffix = if was_cancelled {
+    let cancel_suffix = if was_stalled {
+        "\n\n⏱️ <i>Зависло по таймауту ожидания, остановлено</i>"
+    } else if was_cancelled {
         "\n\n⬛ Генерация остановлена"
     } else {
         ""
@@ -541,7 +573,9 @@ pub async fn stream_response_with_drafts(
 
     // Final commit.
     if accumulated.is_empty() {
-        let empty_msg = if was_cancelled {
+        let empty_msg = if was_stalled {
+            "⏱️ Зависло по таймауту ожидания, остановлено"
+        } else if was_cancelled {
             "⬛ Генерация остановлена"
         } else if !activity_log.is_empty() {
             "🧠 Ход работы получен, но текстовый ответ не пришел."
@@ -556,10 +590,7 @@ pub async fn stream_response_with_drafts(
         return Ok(());
     }
 
-    let mut final_text = accumulated.clone();
-    if sent_attachments.is_empty() {
-        final_text = maybe_send_inline_gpx_artifact(bot, msg, &accumulated).await;
-    }
+    let final_text = accumulated.clone();
 
     let html = format!(
         "{}{}",
@@ -653,26 +684,18 @@ fn parse_stream_event(chunk: &str) -> Option<StreamEventPayload> {
 
 fn apply_stream_event(activity_log: &mut Vec<String>, event: StreamEventPayload) {
     match event.kind.as_str() {
-        "tool" => {
-            let icon = match event.status.as_deref() {
-                Some("completed") => "✅",
-                Some("pending") => "🔧",
-                _ => "🛠",
-            };
-            if let Some(text) = event.text {
-                push_activity(activity_log, format!("{icon} {}", compact_line(&text)));
+        "tool" => match event.status.as_deref() {
+            Some("completed") => {
+                push_activity(activity_log, "✅ Инструменты выполнены".to_string())
             }
-        }
-        "plan" => {
-            let icon = match event.status.as_deref() {
-                Some("completed") => "✅",
-                Some("in_progress") => "🔄",
-                _ => "📋",
-            };
-            if let Some(text) = event.text {
-                push_activity(activity_log, format!("{icon} {}", compact_line(&text)));
-            }
-        }
+            Some("pending") => push_activity(activity_log, "🛠 Использую инструменты".to_string()),
+            _ => push_activity(activity_log, "🛠 Работаю с инструментами".to_string()),
+        },
+        "plan" => match event.status.as_deref() {
+            Some("completed") => push_activity(activity_log, "✅ Шаг плана завершен".to_string()),
+            Some("in_progress") => push_activity(activity_log, "🔄 Выполняю шаг плана".to_string()),
+            _ => push_activity(activity_log, "📋 Обновляю план".to_string()),
+        },
         "error" => {
             if let Some(text) = event.text {
                 push_activity(activity_log, format!("⚠️ {}", compact_line(&text)));
@@ -708,6 +731,7 @@ async fn render_placeholder_draft(
     activity_log: &[String],
     waiting_phase: usize,
     draft_mode: DraftMode,
+    callback_key: Option<&str>,
     last_draft: &mut String,
 ) {
     let Some(pid) = placeholder_id else {
@@ -719,10 +743,19 @@ async fn render_placeholder_draft(
         return;
     }
 
-    bot.edit_message_text(msg.chat.id, pid, draft.clone())
-        .await
-        .ok();
+    let mut req = bot.edit_message_text(msg.chat.id, pid, draft.clone());
+    if let Some(key) = callback_key {
+        req = req.reply_markup(stop_inline_keyboard(key));
+    }
+    req.await.ok();
     *last_draft = draft;
+}
+
+fn stop_inline_keyboard(callback_key: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "🛑 Stop",
+        callback_key,
+    )]])
 }
 
 fn build_draft_text(
@@ -737,11 +770,7 @@ fn build_draft_text(
     match draft_mode {
         DraftMode::Compact => {
             let out = if accumulated.trim().is_empty() {
-                if let Some(last) = activity_log.last() {
-                    format!("{waiting_label}\n{last}")
-                } else {
-                    waiting_label.to_string()
-                }
+                waiting_label.to_string()
             } else {
                 tail_text(accumulated, 2800)
             };
@@ -796,108 +825,9 @@ fn tail_text(text: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-async fn maybe_send_inline_gpx_artifact(bot: &Bot, msg: &Message, response_text: &str) -> String {
-    let Some(gpx_payload) = extract_gpx_payload(response_text) else {
-        return response_text.to_string();
-    };
 
-    let file_name = guess_gpx_filename(response_text);
-    let temp_path = build_temp_output_path(&file_name);
 
-    if std::fs::write(&temp_path, gpx_payload.as_bytes()).is_err() {
-        return response_text.to_string();
-    }
 
-    let mut req = bot.send_document(msg.chat.id, InputFile::file(&temp_path));
-    if let Some(tid) = msg.thread_id {
-        req = req.message_thread_id(tid);
-    }
-
-    let send_ok = req.await.is_ok();
-    std::fs::remove_file(&temp_path).ok();
-
-    if !send_ok {
-        return response_text.to_string();
-    }
-
-    let note = format!("📎 Файл `{file_name}` отправлен вложением.");
-    response_text.replacen(&gpx_payload, &note, 1)
-}
-
-fn extract_gpx_payload(text: &str) -> Option<String> {
-    let gpx_start = text.find("<gpx")?;
-    let gpx_end_rel = text[gpx_start..].find("</gpx>")?;
-    let gpx_end = gpx_start + gpx_end_rel + "</gpx>".len();
-
-    let xml_start = text[..gpx_start]
-        .rfind("<?xml")
-        .filter(|idx| gpx_start.saturating_sub(*idx) < 512)
-        .unwrap_or(gpx_start);
-
-    let payload = text[xml_start..gpx_end].trim();
-    if payload.len() < 80 {
-        return None;
-    }
-
-    Some(payload.to_string())
-}
-
-fn guess_gpx_filename(text: &str) -> String {
-    let mut fallback = "route.gpx".to_string();
-
-    for raw in text.split_whitespace() {
-        let candidate = raw
-            .trim_matches(|c: char| {
-                c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | ')' | '(')
-            })
-            .trim_start_matches("./")
-            .to_string();
-
-        if candidate.to_ascii_lowercase().ends_with(".gpx") && candidate.len() <= 120 {
-            let file = Path::new(&candidate)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or(candidate);
-            let sanitized = sanitize_filename(&file);
-            if sanitized.to_ascii_lowercase().ends_with(".gpx") {
-                return sanitized;
-            }
-        }
-    }
-
-    if !fallback.to_ascii_lowercase().ends_with(".gpx") {
-        fallback.push_str(".gpx");
-    }
-    fallback
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if cleaned.is_empty() {
-        "route.gpx".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn build_temp_output_path(file_name: &str) -> PathBuf {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("toodles_{pid}_{millis}_{file_name}"))
-}
 
 async fn extract_text_and_send_attachments(
     bot: &Bot,

@@ -28,6 +28,8 @@ use tracing::{debug, error, info, warn};
 pub enum AcpEvent {
     /// Streaming text chunk from the agent's response.
     TextChunk(String),
+    /// Internal activity heartbeat (used to avoid false "stalled" timeouts).
+    ActivityTick,
     /// A tool call has been initiated.
     ToolCall { title: String, status: String },
     /// Progress update for an ongoing tool call.
@@ -543,9 +545,11 @@ fn handle_notification(
                 );
             }
         }
-        // Intentionally not forwarded to user-facing text stream.
-        // Keep model reasoning internal and surface only structured progress.
-        "agent_thought_chunk" => {}
+        // Keep model reasoning text private, but emit a heartbeat so
+        // long-running tasks don't look stalled when thought chunks stream.
+        "agent_thought_chunk" => {
+            event_tx.send(AcpEvent::ActivityTick).ok();
+        }
         "tool_call" => {
             let title = update["title"].as_str().unwrap_or("unknown").to_string();
             let status = update["status"].as_str().unwrap_or("pending").to_string();
