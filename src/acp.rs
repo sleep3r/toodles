@@ -481,7 +481,7 @@ async fn handle_agent_request(
                 "id": id,
                 "result": {
                     "outcome": {
-                        "kind": "selected",
+                        "outcome": "selected",
                         "optionId": option_id
                     }
                 }
