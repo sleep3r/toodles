@@ -357,7 +357,7 @@ impl AcpConnection {
                 "sessionId": session_id,
                 "prompt": prompt
             }),
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(90 * 60),
         )
         .await
     }
@@ -524,6 +524,10 @@ fn handle_notification(
     let Some(params) = params else { return };
     let update = &params["update"];
     let update_type = update["sessionUpdate"].as_str().unwrap_or("");
+    // Any session/update notification means the agent is still alive.
+    // Emit a heartbeat first so higher-level watchdogs don't treat unknown
+    // update kinds as inactivity.
+    event_tx.send(AcpEvent::ActivityTick).ok();
     debug!(
         "ACP ← [{update_type}] {}",
         serde_json::to_string(update).unwrap_or_default()

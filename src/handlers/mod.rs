@@ -355,7 +355,7 @@ pub async fn stream_response_with_drafts(
     const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
     const TYPING_INTERVAL: Duration = Duration::from_secs(4);
     const WAITING_TICK_INTERVAL: Duration = Duration::from_secs(2);
-    const STALL_TIMEOUT: Duration = Duration::from_secs(600);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
     // Show typing indicator immediately.
     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
@@ -824,10 +824,6 @@ fn tail_text(text: &str, max_chars: usize) -> String {
     let tail: String = text.chars().skip(start_idx).collect();
     format!("…{tail}")
 }
-
-
-
-
 
 async fn extract_text_and_send_attachments(
     bot: &Bot,

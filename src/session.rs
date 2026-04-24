@@ -164,9 +164,9 @@ impl Session {
         let mut cancel_grace_deadline: Option<Instant> = None;
         let mut abort_reason: Option<String> = None;
 
-        const MAX_PROMPT_RUNTIME: Duration = Duration::from_secs(20 * 60);
-        const NO_EVENT_SOFT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-        const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(12);
+        const MAX_PROMPT_RUNTIME: Duration = Duration::from_secs(60 * 60);
+        const NO_EVENT_SOFT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+        const CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(20);
 
         let mut watchdog_tick = tokio::time::interval(Duration::from_secs(2));
         watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -270,8 +270,6 @@ impl Session {
         Ok(())
     }
 }
-
-
 
 /// Forward an ACP event to the text channel used by streaming display.
 async fn forward_event(tx: &mpsc::Sender<String>, event: AcpEvent) {
